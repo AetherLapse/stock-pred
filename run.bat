@@ -28,13 +28,23 @@ if not exist ".venv\Scripts\python.exe" (
   %PY% -m venv .venv || (echo could not create .venv & pause & exit /b 1)
 )
 
-if not exist ".venv\.deps-ok" (
-  echo installing dependencies ^(once^)
+REM The stamp stores a hash of requirements.txt, so adding a dependency re-installs
+REM automatically instead of leaving an old venv in place.
+set "REQHASH="
+for /f "skip=1 delims=" %%H in ('certutil -hashfile requirements.txt MD5') do (
+  if not defined REQHASH set "REQHASH=%%H"
+)
+set "REQHASH=%REQHASH: =%"
+set "OLDHASH="
+if exist ".venv\.deps-ok" set /p OLDHASH=<".venv\.deps-ok"
+
+if not "%REQHASH%"=="%OLDHASH%" (
+  echo installing dependencies
   .venv\Scripts\python.exe -m pip install --quiet --upgrade pip
   .venv\Scripts\python.exe -m pip install --quiet -r requirements.txt || (
     echo dependency install failed & pause & exit /b 1
   )
-  echo ok> ".venv\.deps-ok"
+  > ".venv\.deps-ok" echo %REQHASH%
 )
 
 if /I "%~1"=="--check" (

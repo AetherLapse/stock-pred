@@ -28,11 +28,14 @@ if [ ! -x "$PYBIN" ]; then
 fi
 
 # 2) dependencies -----------------------------------------------------------
-if [ ! -f "$STAMP" ]; then
-  say "installing dependencies (once)"
+# The stamp holds a hash of requirements.txt, so adding a dependency re-installs
+# automatically instead of leaving an old venv in place.
+REQ_HASH=$("$PYBIN" -c "import hashlib,pathlib;print(hashlib.md5(pathlib.Path('requirements.txt').read_bytes()).hexdigest())" 2>/dev/null || echo none)
+if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$REQ_HASH" ]; then
+  say "installing dependencies"
   "$PYBIN" -m pip install --quiet --upgrade pip
   "$PYBIN" -m pip install --quiet -r requirements.txt
-  touch "$STAMP"
+  printf '%s' "$REQ_HASH" > "$STAMP"
 fi
 
 # 3) offline self-test ------------------------------------------------------

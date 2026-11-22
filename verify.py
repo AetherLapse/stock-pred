@@ -910,6 +910,31 @@ def t_totp_validator():
 check("totp: secret shape is validated before the API is called", t_totp_validator)
 
 
+
+def t_ist_fallback():
+    """Windows has no tz database; the run must still be on IST (any real session needs it)."""
+    from datetime import datetime as _dt
+    probe = _dt(2026, 11, 23, 12, 0)
+    real = C.resolve_ist()
+    assert probe.replace(tzinfo=real).utcoffset().total_seconds() == 19800, real   # +05:30
+    assert probe.replace(tzinfo=C.IST).utcoffset().total_seconds() == 19800
+    # simulate Windows without tzdata
+    import zoneinfo
+    original = C.ZoneInfo          # cas_logger imported the name; patch it there
+    try:
+        def boom(_key):
+            raise zoneinfo.ZoneInfoNotFoundError("No time zone found")
+        C.ZoneInfo = boom
+        fallback = C.resolve_ist()
+        assert probe.replace(tzinfo=fallback).utcoffset().total_seconds() == 19800, fallback
+        assert str(fallback) == "IST"
+    finally:
+        C.ZoneInfo = original
+
+
+check("time: IST resolves with or without a tz database (Windows)", t_ist_fallback)
+
+
 print("\n================ RESULT ================")
 print(f"passed {len(OK)} / {len(OK) + len(FAIL)}")
 if FAIL:

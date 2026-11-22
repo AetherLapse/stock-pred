@@ -97,7 +97,7 @@ import threading
 import time
 import traceback
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -105,7 +105,18 @@ from zoneinfo import ZoneInfo
 import requests
 
 VERSION = "1.0"
-IST = ZoneInfo("Asia/Kolkata")
+def resolve_ist():
+    """India Standard Time, with a fallback that works on Windows.
+
+    Windows ships no IANA tz database, so ZoneInfo("Asia/Kolkata") raises unless the `tzdata`
+    package is installed. IST has no daylight saving, so a fixed +05:30 offset is exactly correct."""
+    try:
+        return ZoneInfo("Asia/Kolkata")
+    except Exception:  # noqa: BLE001 - ZoneInfoNotFoundError, ImportError, missing tzdata
+        return timezone(timedelta(hours=5, minutes=30), "IST")
+
+
+IST = resolve_ist()
 
 DEFAULT_BASE_URL = "https://api.mstock.trade/openapi/typea"
 DEFAULT_WS_URL = "wss://ws.mstock.trade"
