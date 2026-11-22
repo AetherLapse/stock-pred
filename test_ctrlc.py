@@ -81,16 +81,25 @@ def main() -> int:
     survived = p.poll() is None
     ignored = any("Ctrl-C ignored" in ln for ln in lines)
 
-    print("sending two Ctrl-C presses (the intent)")
-    p.send_signal(signal.SIGINT)
-    time.sleep(0.7)
-    p.send_signal(signal.SIGINT)
+    print("sending SIGHUP (terminal closed)")
+    huhp_ok = True
+    if hasattr(signal, "SIGHUP"):
+        p.send_signal(signal.SIGHUP)
+        time.sleep(2.5)
+        huhp_ok = p.poll() is None
+        lines.append(f"__sighup_survived={huhp_ok}")
+
+    print("sending SIGTERM (deliberate stop)")
+    if hasattr(signal, "SIGTERM"):
+        p.send_signal(signal.SIGTERM)
+    else:
+        p.terminate()
 
     try:
         rc = p.wait(timeout=45)
     except subprocess.TimeoutExpired:
         p.kill()
-        print("FAIL: did not exit after two presses")
+        print("FAIL: did not exit after the stop signal")
         print("\n".join(lines[-15:]))
         return 1
 
@@ -102,9 +111,11 @@ def main() -> int:
         ended = '"name":"end"' in text or '"name": "end"' in text
         closed = text.rstrip().endswith("}")
 
-    ok = survived and ignored and rc == 0 and ended
+    sighup = any("__sighup_survived=True" in ln for ln in lines)
+    ok = survived and ignored and sighup and rc == 0 and ended
     print(f"  survived the first press : {survived}")
     print(f"  logged the ignored press : {ignored}")
+    print(f"  survived the SIGHUP      : {sighup}")
     print(f"  exit code                : {rc}")
     print(f"  log has an 'end' event   : {ended}")
     print(f"  log ends on a whole line : {closed}")

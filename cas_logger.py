@@ -86,6 +86,8 @@ import csv
 import json
 import os
 import re
+import atexit
+import shutil
 import signal
 import math
 import statistics
@@ -111,6 +113,75 @@ BASE_URL = os.environ.get("MSTOCK_BASE_URL", DEFAULT_BASE_URL)
 WS_URL = os.environ.get("MSTOCK_WS_URL", DEFAULT_WS_URL)
 
 
+_WRITERS = {"out": None, "raw": None, "done": False, "path": None}
+
+
+def final_flush(reason: str = "atexit") -> None:
+    """Last-resort flush, safe to call from atexit, a crash hook, or the normal wrap-up."""
+    if _WRITERS["done"]:
+        return
+    _WRITERS["done"] = True
+    out = _WRITERS["out"]
+    try:
+        if out is not None and not getattr(out, "closed", False):
+            out.write({"type": "event", "t": ts(), "name": "final_flush", "reason": reason})
+            out.flush()
+            out.close()
+    except Exception:  # noqa: BLE001
+        pass
+    raw = _WRITERS["raw"]
+    try:
+        if raw is not None and not getattr(raw, "closed", False):
+            raw.flush()
+            raw.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def install_crash_hook(out_dir: Path) -> None:
+    """A traceback on stderr scrolls away; write it next to the log so a crash is diagnosable."""
+    def hook(exc_type, exc, tb):
+        import traceback
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        try:
+            (out_dir / f"crash_{now():%Y%m%d_%H%M%S}.txt").write_text(text, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        final_flush("crash")
+        sys.__excepthook__(exc_type, exc, tb)
+    sys.excepthook = hook
+
+
+def require_disk(path: Path, need_mb: int = 200) -> None:
+    """A full disk mid-window would truncate the log silently. Refuse to start instead."""
+    free_mb = shutil.disk_usage(path).free / 1_000_000
+    if free_mb < need_mb:
+        sys.exit(f"only {free_mb:.0f} MB free under {path} — need {need_mb} MB for a session")
+
+
+class Heartbeat:
+    """Writes a heartbeat every 30s so a truncated log is obvious after the fact."""
+
+    def __init__(self, out, interval: float = 30.0):
+        self.out, self.interval = out, interval
+        self.stop_flag = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="heartbeat")
+
+    def _loop(self):
+        while not self.stop_flag.wait(self.interval):
+            try:
+                self.out.write({"type": "event", "t": ts(), "name": "heartbeat",
+                                "recording": not STOP.is_set()})
+            except Exception:  # noqa: BLE001
+                return
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_flag.set()
+
+
 def refresh_endpoints() -> None:
     """Re-read the endpoints after .env is loaded.
 
@@ -131,6 +202,17 @@ _ALLOW_SINGLE = {"v": False}
 _SIGINT_EVENT = {"fn": None}
 
 
+def _note_event(payload: dict) -> None:
+    """Write a diagnostic event from a signal handler; never raise out of a handler."""
+    fn = _SIGINT_EVENT.get("fn")
+    if not fn:
+        return
+    try:
+        fn(payload)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def sigint_should_stop(armed: bool, last_press: float, now_m: float,
                        window: float = SIGINT_CONFIRM_S) -> bool:
     """True = stop now. False = swallow this press and wait for confirmation.
@@ -139,6 +221,32 @@ def sigint_should_stop(armed: bool, last_press: float, now_m: float,
     if _ALLOW_SINGLE["v"] or not armed:
         return True
     return (now_m - last_press) < window
+
+
+def signal_policy(name: str, armed: bool, allow_single: bool = False) -> str:
+    """What to do with a terminating signal: 'stop', 'ignore', or 'ignore-once'.
+
+    SIGTERM / SIGQUIT / SIGBREAK are deliberate: stop and flush, no confirmation.
+    SIGHUP usually means the terminal or SSH session went away. Killing the run there would cost the
+    session for no reason, so while armed it is ignored (the log and dashboard keep working) and it
+    stops normally outside the window."""
+    if name in ("SIGTERM", "SIGQUIT", "SIGBREAK"):
+        return "stop"
+    if name == "SIGHUP":
+        return "ignore-once" if armed and not allow_single else "stop"
+    return "stop"
+
+
+def _on_signal(signum, frame):  # noqa: ARG001
+    name = signal.Signals(signum).name
+    action = signal_policy(name, _SIGINT["armed"], _ALLOW_SINGLE["v"])
+    if action == "stop":
+        STOP.set()
+        say(f"{name}: stopping, flushing logs ...")
+        return
+    say(f"{name} ignored — the terminal went away, the session keeps recording. "
+        f"Press Ctrl+C twice or send SIGTERM to stop.")
+    _note_event({"type": "event", "t": ts(), "name": "sighup_ignored"})
 
 
 def _on_sigint(signum, frame):  # noqa: ARG001
@@ -432,6 +540,7 @@ class JsonlWriter:
         self.f = open(path, "a", encoding="utf-8", buffering=1 << 16)
         self.lock = threading.Lock()
         self.last_flush = time.monotonic()
+        self.closed = False
 
     def write(self, obj: dict) -> None:
         line = json.dumps(obj, separators=(",", ":"), default=str)
@@ -447,11 +556,19 @@ class JsonlWriter:
 
     def close(self) -> None:
         with self.lock:
+            if self.closed:
+                return
+            self.closed = True
             try:
                 self.f.flush()
                 os.fsync(self.f.fileno())
-            except OSError:
+            except (OSError, ValueError):
                 pass
+            finally:
+                try:
+                    self.f.close()
+                except (OSError, ValueError):
+                    pass
             self.f.close()
 
 
@@ -1272,8 +1389,13 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _on_sigint)
     _ALLOW_SINGLE["v"] = bool(args.allow_single_sigint)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, lambda *_: STOP.set())
+    for name in ("SIGTERM", "SIGQUIT", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _on_signal)
+            except (OSError, ValueError):      # not supported on this platform/thread
+                pass
 
     if day.weekday() >= 5 and not args.test:
         say(f"WARNING: {day} is a weekend, exchanges are closed.")
@@ -1368,8 +1490,15 @@ def main() -> None:
 
     # ---- writers + meta -------------------------------------------------------
     main_path = out_dir / f"cas_{day.isoformat()}.jsonl"
+    require_disk(out_dir)
     out = JsonlWriter(main_path)
     raw = JsonlWriter(out_dir / f"cas_{day.isoformat()}.ws_raw.jsonl")
+    _WRITERS.update(out=out, raw=raw, path=main_path, done=False)
+    atexit.register(final_flush)
+    install_crash_hook(out_dir)
+    _SIGINT_EVENT["fn"] = out.write
+    heartbeat = Heartbeat(out)
+    heartbeat.start()
     feed: WSFeed | None = None
 
     pre, errs = fetch_ohlc(sess, headers, uni.keys())
@@ -1709,7 +1838,9 @@ def main() -> None:
                "events_suppressed": dict(feed._suppressed), "errors": len(ERRORS)})
     STOP.set()
     feed.stop()
+    heartbeat.stop()
     time.sleep(0.5)
+    _WRITERS["done"] = True
     out.close()
     raw.close()
     say(f"done. log: {main_path}")

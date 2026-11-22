@@ -115,6 +115,23 @@ A manual indicative close can be typed into the logger at any time (`NIFTY 25065
 futures estimate for that index and **both** numbers are recorded, so `--calibrate` can measure the
 estimate's bias afterwards.
 
+## What can end the run, and what happens
+
+| signal | while recording | why |
+|---|---|---|
+| `Ctrl+C` (SIGINT) | **ignored** once, stops on a second press within 5 s | the accident you actually make |
+| `SIGHUP` (terminal / SSH closed) | **ignored** — keeps recording to disk | losing the window must not lose the session |
+| `SIGTERM`, `SIGQUIT` | stops, flushes, writes `end` | deliberate |
+| `SIGBREAK` (Windows Ctrl+Break) | stops, flushes | deliberate |
+| window closed / `kill -9` | no handler runs; you lose at most ~1 s | the log flushes continuously |
+
+Beyond signals:
+
+- **`atexit` + crash hook** — any exit path flushes the log and appends a `final_flush` marker, and an
+  unhandled exception writes `crash_<timestamp>.txt` next to the log instead of vanishing with the console.
+- **Heartbeat** — an event every 30 s, so a log that stops early is obvious.
+- **Disk guard** — refuses to start with under 200 MB free rather than truncating mid-session.
+
 ## Ctrl+C cannot cost you the session
 
 While a session is armed (from feed connect to the end of the recording window) a single `Ctrl+C` is

@@ -820,6 +820,81 @@ def t_ctrlc_policy():
 check("Ctrl-C: single press ignored while armed, double press stops", t_ctrlc_policy)
 
 
+
+def t_signal_policy():
+    """Deliberate signals stop; a lost terminal does not cost the session."""
+    # deliberate: always stop, armed or not
+    for name in ("SIGTERM", "SIGQUIT", "SIGBREAK"):
+        assert C.signal_policy(name, armed=False) == "stop"
+        assert C.signal_policy(name, armed=True) == "stop"
+    # hangup: ignored while armed (keep recording), stops otherwise
+    assert C.signal_policy("SIGHUP", armed=True) == "ignore-once"
+    assert C.signal_policy("SIGHUP", armed=False) == "stop"
+    # ...unless the operator asked for one-signal stops
+    assert C.signal_policy("SIGHUP", armed=True, allow_single=True) == "stop"
+
+
+def t_writer_close_idempotent():
+    """close() must be safe to call twice (wrap-up then atexit) and must really close."""
+    f = Path("_wr_test.jsonl")
+    f.unlink(missing_ok=True)          # JsonlWriter appends; start from a clean file
+    w = C.JsonlWriter(f)
+    w.write({"type": "event", "name": "x"})
+    w.close()
+    assert w.closed is True
+    w.close()                      # second call: no exception, no duplicate work
+    assert f.read_text().count("\n") == 1
+
+
+check("signals: TERM/QUIT always stop, SIGHUP ignored while armed", t_signal_policy)
+check("writer: close is idempotent and flushes to disk", t_writer_close_idempotent)
+
+
+
+def t_heartbeat_and_flush():
+    """Heartbeat proves liveness; final_flush leaves a marker when the normal exit never ran."""
+    import time as _t
+    f = Path("_hb_test.jsonl")
+    f.unlink(missing_ok=True)
+    w = C.JsonlWriter(f)
+    hb = C.Heartbeat(w, interval=0.15)
+    hb.start()
+    _t.sleep(0.45)
+    hb.stop()
+    _t.sleep(0.2)
+    w.flush()                          # the writer batches flushes; force one before reading
+    assert "heartbeat" in f.read_text()
+
+    C._WRITERS.update(out=w, raw=None, done=False)
+    C.final_flush("unit-test")
+    text = f.read_text()
+    assert '"name":"final_flush"' in text and '"reason":"unit-test"' in text
+    assert w.closed is True
+    # second call must not append another marker
+    C._WRITERS["done"] = False
+    Path("_hb_test2.jsonl").unlink(missing_ok=True)
+    C._WRITERS.update(out=C.JsonlWriter(Path("_hb_test2.jsonl")), done=False)
+    C.final_flush("x")
+    C._WRITERS["done"] = False
+    C.final_flush("y")
+    assert Path("_hb_test2.jsonl").read_text().count("final_flush") == 1
+
+
+def t_disk_guard():
+    """A nearly-full disk must refuse to start rather than truncate the session."""
+    try:
+        C.require_disk(Path("."), need_mb=10_000_000)
+    except SystemExit as exc:
+        assert "free" in str(exc)
+    else:
+        raise AssertionError("disk guard did not trigger on an impossible requirement")
+    C.require_disk(Path("."), need_mb=1)      # normal case passes
+
+
+check("heartbeat + final flush: liveness and a marker on abnormal exit", t_heartbeat_and_flush)
+check("disk guard: refuses to start on a full disk", t_disk_guard)
+
+
 print("\n================ RESULT ================")
 print(f"passed {len(OK)} / {len(OK) + len(FAIL)}")
 if FAIL:
