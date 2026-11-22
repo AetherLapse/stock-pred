@@ -22,3 +22,4 @@ dash*.png
 # local backup of the pre-hardening logger
 cas_logger.orig.py
 _verify_*.txt
+report*.png
