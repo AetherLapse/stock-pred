@@ -25,6 +25,36 @@ import cas_logger as C
 
 OK, FAIL = [], []
 
+# ---------------------------------------------------------------------------
+# Fixtures are GENERATED, never assumed: a fresh clone must be able to run this
+# suite with no previous run's artefacts on disk.
+# ---------------------------------------------------------------------------
+def _ensure_fixtures():
+    import make_flow_log
+    import make_synthetic
+    for name in ("flow_up", "flow_down", "flow_noise"):
+        f = Path(f"_flow_{name}.jsonl")
+        if not f.exists():
+            make_flow_log.build(f, name)
+    for name in ("clean", "noisy", "laggy", "pcp_edge"):
+        f = Path(f"_synthetic_{name}.jsonl")
+        if not f.exists():
+            make_synthetic.build(f, name)
+    calib = Path("_calib_demo.jsonl")
+    if not calib.exists():
+        rows = []
+        for i, (manual, computed) in enumerate([(25078, 25084), (25062, 25069), (24980, 24985), (25010, 25029)]):
+            rows.append({"type": "readout", "t": f"2026-11-23T15:27:{10 + i * 5:02d}+05:30", "final": True,
+                         "rows": [{"index": "NIFTY", "target": manual, "target_source": "manual",
+                                   "computed_target": computed}]})
+        rows.append({"type": "readout", "t": "2026-11-23T15:27:40+05:30", "final": True,
+                     "rows": [{"index": "BANKNIFTY", "target": 57790, "target_source": "manual",
+                               "computed_target": 57796}]})
+        calib.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+
+_ensure_fixtures()
+
 
 def check(name, fn):
     try:
