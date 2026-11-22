@@ -741,6 +741,7 @@ class Resolver:
     """Finds index spots, futures, option chains and stocks inside the scriptmaster."""
 
     def __init__(self, rows: list[dict], today: date, overrides: dict):
+        self.rows = rows
         self.today = today
         self.overrides = overrides
         self.by_ex: dict[str, list[dict]] = defaultdict(list)
@@ -762,7 +763,9 @@ class Resolver:
         aliases = [norm(a) for a in cfg["spot_alias"]]
         cands = []
         for r in self.by_ex.get(cfg["spot_ex"], []):
-            if r.get("expiry") or (to_float(r.get("strike")) or 0) > 0:
+            # Only a *real* expiry excludes a row: masters often put "-", "NA" or "" in the
+            # expiry column of index rows, and treating that as a derivative hid them entirely.
+            if parse_expiry(r.get("expiry", "")) or (to_float(r.get("strike")) or 0) > 0:
                 continue
             n1, n2 = norm(r.get("tradingsymbol")), norm(r.get("name"))
             if n1 in aliases or n2 in aliases:
@@ -771,7 +774,24 @@ class Resolver:
                     - (2 if r.get("instrument_type", "").upper() in ("EQ", "BE") else 0)
                 cands.append((score, r))
         if not cands:
+            # Say WHY, with the evidence: any index-looking row whose name mentions the index.
+            key = norm(cfg["und"])
+            looks = []
+            for r in self.rows:
+                blob = norm(r.get("tradingsymbol")) + "/" + norm(r.get("name"))
+                itype = (r.get("instrument_type") or "").upper()
+                seg = (r.get("segment") or "").upper()
+                if key in blob and ("IND" in itype or "IND" in seg or itype in ("", "EQ")):
+                    looks.append(f'{r.get("exchange")}:{r.get("tradingsymbol")}'
+                                 f'[{itype or seg or "?"}]')
+                if len(looks) >= 6:
+                    break
             self.notes.append(f"{idx}: spot NOT found in scriptmaster (use --find / --overrides)")
+            if looks:
+                self.notes.append(f"   {idx}: closest rows: {looks}")
+            else:
+                self.notes.append(f"   {idx}: no row mentions '{cfg['und']}' at all "
+                                  f"— the master may use a different underlying name")
             return None
         cands.sort(key=lambda x: -x[0])
         if len(cands) > 1:

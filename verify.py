@@ -935,6 +935,27 @@ def t_ist_fallback():
 check("time: IST resolves with or without a tz database (Windows)", t_ist_fallback)
 
 
+
+def t_spot_with_placeholder_expiry():
+    """Index rows whose expiry column says '-' must still resolve as spot."""
+    def row(ts, name, itype, tok, exp):
+        return {"exchange": "NSE", "tradingsymbol": ts, "name": name, "instrument_type": itype,
+                "segment": "INDICES", "instrument_token": tok, "expiry": exp, "strike": ""}
+    rows = [row("NIFTY 50", "NIFTY 50", "INDEX", 256265, "-"),
+            row("NIFTY 50", "NIFTY 50", "INDEX", 256265, "NA"),
+            row("NIFTY 50", "NIFTY 50", "INDEX", 256265, "")]
+    for r in rows:
+        res = C.Resolver([r], __import__("datetime").date(2026, 11, 23), {})
+        assert res.spot("NIFTY") is not None, f"failed with expiry={r['expiry']!r}"
+    # a real future with a real expiry must still be excluded from spot matching
+    fut = row("NIFTY FUT", "NIFTY", "FUT", 999, "2026-11-27")
+    res = C.Resolver([fut], __import__("datetime").date(2026, 11, 23), {})
+    assert res.spot("NIFTY") is None
+
+
+check("resolver: placeholder expiry does not hide an index spot row", t_spot_with_placeholder_expiry)
+
+
 print("\n================ RESULT ================")
 print(f"passed {len(OK)} / {len(OK) + len(FAIL)}")
 if FAIL:
