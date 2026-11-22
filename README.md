@@ -56,7 +56,8 @@ Manual equivalent, if you prefer:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-cp .env.example .env        # fill MSTOCK_API_KEY (+ TOTP, or a same-day access token)
+cp .env.example .env        # fill MSTOCK_API_KEY + one of TOTP_SECRET / TOTP / ACCESS_TOKEN
+                            # (the api/ws endpoints are already the defaults)
 .venv/bin/python verify.py            # 39 unit checks
 .venv/bin/python stress_test.py       # 100 generated scenarios
 
