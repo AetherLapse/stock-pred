@@ -276,6 +276,59 @@ def safe_call(where: str, fn, out=None, *args, **kwargs):
         return None
 
 
+def needs_late_baseline(kind: str, label: str, base_label: str, have_baseline: bool,
+                        event_at: datetime, now_dt: datetime, tol_s: int = 15) -> bool:
+    """True when the baseline snapshot is already in the past and has not been taken yet.
+
+    Starting at 15:15 (or later) means the 15:15:10 snapshot is gone; skipping it would leave the
+    whole session without a reference point, so the run takes one immediately instead."""
+    if kind != "snap" or label != base_label or have_baseline:
+        return False
+    return event_at < now_dt - timedelta(seconds=tol_s)
+
+
+def start_dashboard(log_path, host: str = "127.0.0.1", port: int = 8080, open_browser: bool = True):
+    """Serve the live dashboard from inside the logger, so one command is enough.
+
+    It tails the same JSONL this process is writing. Returns the URL, or None when the dashboard
+    module or a free port is unavailable — the logger never depends on it working.
+    """
+    try:
+        import cas_dashboard as dash
+    except Exception as exc:  # noqa: BLE001
+        say(f"dashboard unavailable ({exc.__class__.__name__}: {exc}) — logging only")
+        return None
+    try:
+        live = dash.Live(Path(log_path))
+        live.poll()
+        srv = None
+        for candidate in range(port, port + 12):
+            try:
+                srv = dash.ThreadingHTTPServer((host, candidate), dash.make_handler(live))
+                port = candidate
+                break
+            except OSError:
+                continue
+        if srv is None:
+            say(f"dashboard: no free port in {port}-{port + 11}")
+            return None
+        threading.Thread(target=srv.serve_forever, daemon=True, name="dashboard").start()
+        url = f"http://{host}:{port}/"
+        say(f"dashboard ready: {url}")
+        if open_browser:
+            def _open():
+                try:
+                    import webbrowser
+                    webbrowser.open(url)
+                except Exception:
+                    pass
+            threading.Timer(1.5, _open).start()
+        return url
+    except Exception as exc:  # noqa: BLE001
+        say(f"dashboard failed to start: {exc.__class__.__name__}: {exc} — logging only")
+        return None
+
+
 def load_env(path: str) -> None:
     p = Path(path)
     if not p.exists():
@@ -1138,6 +1191,11 @@ def parse_args():
                    help="binary frame layout; docs specify 'fixed' ([count][size][packets])")
     p.add_argument("--full-depth", action="store_true", help="keep 5-level depth for options/futures too")
     p.add_argument("--no-rest", action="store_true")
+    p.add_argument("--no-dashboard", action="store_true", help="do not start the web dashboard")
+    p.add_argument("--no-open", action="store_true", help="start the dashboard but do not open a browser")
+    p.add_argument("--dash-port", type=int, default=8080, help="first port to try for the dashboard")
+    p.add_argument("--dash-host", default="127.0.0.1",
+                   help="'0.0.0.0' to reach the dashboard from a phone on the same network")
     p.add_argument("--overrides", help="JSON: {\"NIFTY\": {\"token\": 123, \"symbol\": \"Nifty 50\"}}")
     p.add_argument("--test", type=int, metavar="SECONDS",
                    help="ignore the clock: record for SECONDS starting now (market must be open)")
@@ -1490,6 +1548,10 @@ def main() -> None:
         say(f"snapshot '{label}': rest {len(data)}/{len(uni.keys())}, ws tokens {len(feed.latest)}"
             + (f", +{added} option tokens" if added else ""))
 
+    if not args.no_dashboard:
+        start_dashboard(out.path, host=args.dash_host, port=args.dash_port,
+                        open_browser=not args.no_open)
+
     say(f"plan: connect {connect_at:%H:%M:%S} | record {rec_start:%H:%M:%S}-{rec_end:%H:%M:%S} | "
         f"snapshots {[l for _, l in snaps]}")
     sleep_until(connect_at, status)
@@ -1534,6 +1596,13 @@ def main() -> None:
         if STOP.is_set():
             break
         if t < now() - timedelta(seconds=15) and kind != "stop":
+            # The baseline is the whole measurement. If the run starts late (say 15:15), that
+            # snapshot is already in the past: take it now, after a short warm-up so ticks exist.
+            if needs_late_baseline(kind, label, base_label, bool(baseline), t, now()):
+                say(f"late start: the {label} baseline is in the past — taking it now after a 6s warm-up")
+                time.sleep(6)
+                safe_call(f"late_baseline[{label}]", snapshot, out, label)
+                continue
             say(f"skipping {kind} {label or ''} (time already passed)")
             if kind == "start":
                 feed.recording.set()

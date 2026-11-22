@@ -45,11 +45,15 @@ cp .env.example .env        # fill MSTOCK_API_KEY (+ TOTP, or a same-day access 
 .venv/bin/python verify.py            # 37 unit checks
 .venv/bin/python stress_test.py       # 100 generated scenarios
 
-# a live session — start ~15:05 on an expiry day
+# a live session — one command, dashboard included
 .venv/bin/python cas_logger.py --rec-end 15:32:00
+#   -> dashboard ready: http://127.0.0.1:8080/   (opens a browser unless --no-open)
 
-# watch it, in a second terminal
-.venv/bin/python cas_dashboard.py --log cas_logs/$(date +%F)/cas_$(date +%F).jsonl --open
+# before 15:15 the baseline snapshot is taken normally; if you start later, it is
+# taken immediately after a 6s warm-up instead of being skipped
+
+# review a finished session later
+.venv/bin/python cas_dashboard.py --log cas_logs/<date>/cas_<date>.jsonl --open
 
 # after the close
 .venv/bin/python cas_logger.py   --summarize cas_logs/<date>/cas_<date>.jsonl
@@ -65,7 +69,7 @@ cp .env.example .env        # fill MSTOCK_API_KEY (+ TOTP, or a same-day access 
 | `cas_logger.py` | the recorder: auth, universe, WebSocket, REST polling, snapshots, live + final readout |
 | `cas_flow.py` | order-flow read of 15:20–15:27: Δbuy/Δsell, Δimbalance, depth lean, signed volume, who bought/sold |
 | `cas_analysis.py` | scores price estimators (futures, mid, microprice, put-call parity) against the realised jump; `--calibrate` compares the estimate with a manually entered indicative close |
-| `cas_dashboard.py` | single-file web dashboard that tails the log — live or replay |
+| `cas_dashboard.py` | single-file web dashboard that tails the log — live or replay; `cas_logger.py` starts it automatically (`--no-dashboard`, `--no-open`, `--dash-port`, `--dash-host`) |
 | `verify.py` | unit checks: parsing, resolution, scaling, decisions, calibration |
 | `stress_test.py` | 100 generated sessions: 8 market shapes × 20 data defects × 10 index sets |
 | `stub_api.py` | fake mStock REST, so the full pipeline runs with no credentials |

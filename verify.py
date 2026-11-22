@@ -723,6 +723,30 @@ def t_prior():
 check("prior: base rate carried from the Aug-Nov sheet", t_prior)
 
 
+
+def t_late_baseline():
+    from datetime import datetime, timedelta
+    n = datetime(2026, 11, 23, 15, 15, 0)
+    past = n - timedelta(minutes=3)
+    future = n + timedelta(minutes=2)
+    # a 15:15 start: baseline time already gone, nothing recorded yet -> catch up
+    assert C.needs_late_baseline("snap", "15:15:10", "15:15:10", False, past, n) is True
+    # already have a baseline -> never retake
+    assert C.needs_late_baseline("snap", "15:15:10", "15:15:10", True, past, n) is False
+    # future baseline -> normal scheduling
+    assert C.needs_late_baseline("snap", "15:15:10", "15:15:10", False, future, n) is False
+    # other snapshots are still skipped, not caught up
+    assert C.needs_late_baseline("snap", "15:14:50", "15:15:10", False, past, n) is False
+    # only snapshots, never start/stop/decide
+    assert C.needs_late_baseline("start", "15:15:10", "15:15:10", False, past, n) is False
+    # 10s late is inside the tolerance, 20s is not
+    assert C.needs_late_baseline("snap", "15:15:10", "15:15:10", False, n - timedelta(seconds=10), n) is False
+    assert C.needs_late_baseline("snap", "15:15:10", "15:15:10", False, n - timedelta(seconds=20), n) is True
+
+
+check("late start: baseline is caught up, other steps are still skipped", t_late_baseline)
+
+
 print("\n================ RESULT ================")
 print(f"passed {len(OK)} / {len(OK) + len(FAIL)}")
 if FAIL:

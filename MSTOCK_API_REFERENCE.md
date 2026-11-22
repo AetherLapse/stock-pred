@@ -535,3 +535,28 @@ the manual step eventually disappears: measure the offset, then subtract it.
 **3. The base rate is stated, not implied.** `cas_flow.py` now prints the prior from the Aug–Nov sheet
 (NIFTY closed above 3:15 on 10/16 expiries = 62.5%) next to any hit rate, because a 55% signal that
 loses to "always CE" is worse than no signal.
+
+---
+
+## 15. Starting it (one command)
+
+```bash
+python cas_logger.py --rec-end 15:32:00
+# dashboard ready: http://127.0.0.1:8080/
+```
+
+The logger starts the dashboard itself, in a thread, tailing the log it is writing. Flags:
+
+| flag | use |
+|---|---|
+| `--no-dashboard` | logging only |
+| `--no-open` | serve, but don't launch a browser |
+| `--dash-port 8090` | first port to try (walks upward if busy) |
+| `--dash-host 0.0.0.0` | reach it from a phone on the same network |
+
+**Starting at 15:15 is supported but not ideal.** The baseline snapshot is due at 15:15:10; if the
+process starts after that, the scheduler no longer skips it — it takes the baseline immediately after a
+6-second warm-up (`late start: … taking it now`) so the session still has a reference point. What you
+lose is the *pre-freeze* reading: a 15:15 start may capture a spot that has already begun to move, and
+the WebSocket needs a few seconds to connect and receive its first ticks. 15:05–15:10 gives a clean
+baseline and a warm feed; 15:15 works; after 15:27:30 there is nothing to record.
