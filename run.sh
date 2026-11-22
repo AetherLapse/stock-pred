@@ -40,6 +40,9 @@ if [ "${1:-}" = "--check" ]; then
   say "offline self-test (no credentials needed)"
   "$PYBIN" verify.py
   "$PYBIN" stress_test.py | tail -5
+  echo
+  say "Ctrl-C behaviour (starts its own stub feed)"
+  "$PYBIN" test_ctrlc.py | tail -8
   exit 0
 fi
 

@@ -42,6 +42,9 @@ if /I "%~1"=="--check" (
   .venv\Scripts\python.exe verify.py
   if errorlevel 1 (pause & exit /b 1)
   .venv\Scripts\python.exe stress_test.py
+  echo.
+  echo Ctrl-C behaviour ^(starts its own stub feed^)
+  .venv\Scripts\python.exe test_ctrlc.py
   pause
   exit /b 0
 )

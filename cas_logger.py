@@ -122,6 +122,41 @@ def refresh_endpoints() -> None:
     WS_URL = os.environ.get("MSTOCK_WS_URL", DEFAULT_WS_URL)
 
 STOP = threading.Event()
+
+# Ctrl+C policy: while the recording window is open, a single press is ignored (an accidental
+# Ctrl+C must not cost the session). Pressing again inside SIGINT_CONFIRM_S seconds really stops.
+SIGINT_CONFIRM_S = 5.0
+_SIGINT = {"armed": False, "last": 0.0, "ignored": 0}
+_ALLOW_SINGLE = {"v": False}
+_SIGINT_EVENT = {"fn": None}
+
+
+def sigint_should_stop(armed: bool, last_press: float, now_m: float,
+                       window: float = SIGINT_CONFIRM_S) -> bool:
+    """True = stop now. False = swallow this press and wait for confirmation.
+
+    Armed means the session is in its recording window; outside it, one press stops as usual."""
+    if _ALLOW_SINGLE["v"] or not armed:
+        return True
+    return (now_m - last_press) < window
+
+
+def _on_sigint(signum, frame):  # noqa: ARG001
+    now_m = time.monotonic()
+    if sigint_should_stop(_SIGINT["armed"], _SIGINT["last"], now_m):
+        STOP.set()
+        say("Ctrl-C: stopping, flushing logs ...")
+        return
+    _SIGINT["last"] = now_m
+    _SIGINT["ignored"] += 1
+    say(f"Ctrl-C ignored — the session is running. Press again within {SIGINT_CONFIRM_S:g}s to stop.")
+    fn = _SIGINT_EVENT.get("fn")
+    if fn:
+        try:
+            fn({"type": "event", "t": ts(), "name": "sigint_ignored",
+                "count": _SIGINT["ignored"]})
+        except Exception:
+            pass
 # Index -> indicative close typed in by the operator (NSE shows it on the terminal; mStock's
 # API does not carry it). When present it replaces the computed target for that index.
 MANUAL: dict[str, float] = {}
@@ -1205,6 +1240,8 @@ def parse_args():
     p.add_argument("--full-depth", action="store_true", help="keep 5-level depth for options/futures too")
     p.add_argument("--no-rest", action="store_true")
     p.add_argument("--no-dashboard", action="store_true", help="do not start the web dashboard")
+    p.add_argument("--allow-single-sigint", action="store_true",
+                   help="let one Ctrl+C stop the run (default: two presses inside 5s)")
     p.add_argument("--no-open", action="store_true", help="start the dashboard but do not open a browser")
     p.add_argument("--dash-port", type=int, default=8080, help="first port to try for the dashboard")
     p.add_argument("--dash-host", default="127.0.0.1",
@@ -1233,7 +1270,8 @@ def main() -> None:
     out_dir = Path(args.out) / day.isoformat()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    signal.signal(signal.SIGINT, lambda *_: (STOP.set(), say("Ctrl-C: stopping, flushing logs ...")))
+    signal.signal(signal.SIGINT, _on_sigint)
+    _ALLOW_SINGLE["v"] = bool(args.allow_single_sigint)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, lambda *_: STOP.set())
 
@@ -1572,6 +1610,8 @@ def main() -> None:
     if STOP.is_set():
         return
     feed.start()
+    _SIGINT["armed"] = True          # protected from here to the end of the recording window
+    _SIGINT_EVENT["fn"] = out.write
     time.sleep(3)
     say("WebSocket " + ("connected" if feed.connected.is_set() else "NOT connected yet (check .env / token)"))
 
@@ -1638,6 +1678,8 @@ def main() -> None:
             if not args.no_rest:
                 poller.enabled.set()
             out.write({"type": "event", "t": ts(), "name": "recording_start"})
+            _SIGINT["armed"] = True
+            _SIGINT_EVENT["fn"] = out.write
             say(">>> RECORDING STARTED")
             if feed.n_pkts == 0:
                 say("!!! ALARM: 0 packets parsed at recording start — the feed is silent or the "
@@ -1653,6 +1695,7 @@ def main() -> None:
         else:
             feed.recording.clear()
             poller.enabled.clear()
+            _SIGINT["armed"] = False
             out.write({"type": "event", "t": ts(), "name": "recording_stop"})
             out.flush()
             raw.flush()

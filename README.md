@@ -115,6 +115,23 @@ A manual indicative close can be typed into the logger at any time (`NIFTY 25065
 futures estimate for that index and **both** numbers are recorded, so `--calibrate` can measure the
 estimate's bias afterwards.
 
+## Ctrl+C cannot cost you the session
+
+While a session is armed (from feed connect to the end of the recording window) a single `Ctrl+C` is
+**ignored** and logged as an `sigint_ignored` event:
+
+```
+[15:20:14] Ctrl-C ignored — the session is running. Press again within 5s to stop.
+```
+
+Press a second time within five seconds and it stops properly: flush, `end` event, whole last line.
+`--allow-single-sigint` restores the usual one-press behaviour for scripted runs, and killing the
+process outright still ends it — nothing survives a `kill -9`, which is why the log is flushed
+continuously rather than at the end.
+
+`test_ctrlc.py` proves it end to end (start, one SIGINT, survive, two SIGINTs, clean shutdown) and
+runs as part of `./run.sh --check`.
+
 ## Honest limitations
 
 - **No CAS field exists in the API.** There is no indicative equilibrium price and no imbalance.

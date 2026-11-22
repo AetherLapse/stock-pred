@@ -799,6 +799,27 @@ def t_env_endpoints():
 check("env: base/ws URLs from .env actually apply", t_env_endpoints)
 
 
+
+def t_ctrlc_policy():
+    """One accidental Ctrl+C during the window must not stop the run; a quick second one must."""
+    C._ALLOW_SINGLE["v"] = False
+    # not armed: stop immediately, as before
+    assert C.sigint_should_stop(False, 0.0, 100.0) is True
+    # armed, no previous press: swallow this one
+    assert C.sigint_should_stop(True, 0.0, 100.0) is False
+    # armed, second press 2s later: stop
+    assert C.sigint_should_stop(True, 98.0, 100.0) is True
+    # armed, press again after the window: treated as a fresh accidental press
+    assert C.sigint_should_stop(True, 90.0, 100.0) is False
+    # explicit opt-out restores one-press stop
+    C._ALLOW_SINGLE["v"] = True
+    assert C.sigint_should_stop(True, 0.0, 100.0) is True
+    C._ALLOW_SINGLE["v"] = False
+
+
+check("Ctrl-C: single press ignored while armed, double press stops", t_ctrlc_policy)
+
+
 print("\n================ RESULT ================")
 print(f"passed {len(OK)} / {len(OK) + len(FAIL)}")
 if FAIL:
