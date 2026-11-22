@@ -33,16 +33,31 @@ This repo answers both with a log instead of an opinion.
   score and a one-word verdict
 - a live dashboard, plus offline scorers that say whether the estimates were any good
 
-## Quick start
+## Quick start — one command
+
+```bash
+./run.sh              # macOS / Linux
+run.bat               # Windows (double-click works too)
+```
+
+The launcher is idempotent: it creates `.venv`, installs `requirements.txt`, then validates `.env` and
+tells you exactly which key is missing. Put the API key and one session credential in `.env` once and
+every later run is a single command.
+
+```bash
+./run.sh --check          # offline self-test, no credentials needed
+./run.sh --test 120       # 2-minute live check during market hours
+./run.sh --find "NIFTY 50"
+./run.sh                  # the real session
+```
+
+Manual equivalent, if you prefer:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install requests websocket-client pyotp
-
+.venv/bin/pip install -r requirements.txt
 cp .env.example .env        # fill MSTOCK_API_KEY (+ TOTP, or a same-day access token)
-
-# prove it works without the market (no credentials needed)
-.venv/bin/python verify.py            # 37 unit checks
+.venv/bin/python verify.py            # 39 unit checks
 .venv/bin/python stress_test.py       # 100 generated scenarios
 
 # a live session — one command, dashboard included
