@@ -303,7 +303,7 @@ def calibrate(path):
 
 def report_calibration(summary, label=""):
     if not summary:
-        print(f"{label}no manual indicative recorded — nothing to calibrate against")
+        print(f"{(label + ': ') if label else ''}no manual indicative recorded — nothing to calibrate against")
         return
     print(f"\n--- calibration{(' ' + label) if label else ''}: futures estimate minus manual indicative")
     for idx, s in summary.items():
@@ -314,7 +314,11 @@ def report_calibration(summary, label=""):
 
 def report(result):
     if "error" in result:
-        print(f"{result['log']}: {result['error']}")
+        print(f"{Path(result['log']).name}: {result['error']}")
+        return
+    if not result.get("index"):
+        print(f"{Path(result['log']).name}: no index had both a baseline and a post-close snapshot "
+              f"— nothing to score")
         return
     print(f"\n=== {Path(result['log']).name}")
     for index, d in result["index"].items():
