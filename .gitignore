@@ -1,0 +1,24 @@
+# environment / python
+.venv/
+__pycache__/
+*.py[cod]
+.env
+
+# runtime output
+cas_logs/
+stress_logs/
+_verify_*/
+_flow_*/
+_dash_*/
+_synthetic_*/
+*.log
+
+# generated fixtures and rendered evidence
+_*.jsonl
+_*.png
+report*.html
+dash*.png
+
+# local backup of the pre-hardening logger
+cas_logger.orig.py
+_verify_*.txt

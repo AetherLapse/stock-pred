@@ -1,0 +1,9 @@
+Errors
+Common Error Types
+Error Type	Status Code	Description
+APIKeyException	403	Indicates that the API key is invalid or has expired. Returned with an HTTP 403 (Forbidden) status code.
+TokenException	401	Indicates that the access token is missing, invalid, or has expired. Returned with an HTTP 401 (Unauthorized) status code.
+InputException	400	Indicates invalid input, such as missing required fields, incorrect parameter values, or malformed requests. Returned with an HTTP 400 (Bad Request) status code.
+URL Not Found	404	Indicates that the requested resource could not be found. Returned with an HTTP 404 (Not Found) status code.
+MiraeException	---	Represents an error response received from the mStock API.
+GeneralException	---	Represents an internal server error that occurred while processing the API request. This should occur only in rare cases.

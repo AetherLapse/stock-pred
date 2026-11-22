@@ -1,0 +1,171 @@
+Market Data WebSocket API
+Overview
+
+The Market Data WebSocket API provides real-time market data through a persistent WebSocket connection. This API supports subscription-based data streaming with multiple data modes and authentication mechanisms.
+
+## Connection Endpoint
+
+Connect to the Mirae WebSocket using the following endpoint:
+
+wss://ws.mstock.trade?API_KEY=your_api_key_here&ACCESS_TOKEN=your_access_token_here
+
+Authentication
+Initial Authentication
+Authentication requires both an API Key and an Access Token.
+The API Key can be obtained from your account dashboard
+An Access Token is generated during the login process.
+Pass both parameters in the WebSocket URL:
+wss://ws.mstock.trade?API_KEY=your_api_key_here&ACCESS_TOKEN=your_access_token_here
+
+Connection will be rejected if either parameter is invalid or expired
+Connection Maintenance
+
+After establishing a successful connection, send the following login message to maintain the session:
+
+LOGIN:your_access_token_here
+
+
+Session Timeout
+
+If the LOGIN message is not sent shortly after the connection is established, the WebSocket session will be automatically terminated.
+
+Request Format
+
+All requests must be sent as JSON messages with the following structure:
+
+Parameter	Description	Type
+a	Action to perform	string
+v	Values/parameters for the action	array
+Available Actions
+subscribe: Subscribe to market data for the specified tokens.
+unsubscribe: Unsubscribe from market data for the specified tokens.
+mode: Set the market data streaming mode.
+Available Modes
+ltp: Last Traded Price (LTP) only.
+quote: Basic quote data
+full: Complete market data, including market depth.
+API Operations
+Subscribe to Market Data
+
+Subscribe to real-time data for specific instrument tokens:
+
+{
+    "a": "subscribe",
+    "v": [55256, 55412]
+}
+
+Unsubscribe from Market Data
+
+Stop receiving data for specific instrument tokens:
+
+{
+    "a": "unsubscribe",
+    "v": [55256, 55412]
+}
+
+Set Data Mode
+
+Configure the level of market data to receive:
+
+{
+    "a": "mode",
+    "v": ["ltp"]
+}
+
+
+Response Structure -
+
+Market data updates are delivered as binary messages. These messages must be parsed as byte streams and converted into the appropriate quote data structures.
+
+Each binary message consists of a header followed by the quote packet data. The structure is as follows:
+
+The first two bytes [short] represent the number of packets contained in the message.
+The next two bytes [short] represent the total size of the quote packet in bytes.
+The remaining bytes contain the quote packet data.
+
+Note
+
+Please Note : 1. [short]: 2 Bytes | [int]: 4 Bytes
+
+Quote Packet Structure: (64 Bytes + Market Depth)
+Field	Type	Bytes
+Token	[int]	0 - 4
+LTP	[int]	4 - 8
+Last Traded Qty	[int]	8 - 12
+Average Traded Price	[int]	12 - 16
+Volume Traded Today	[int]	16 - 20
+Total Buy Qty	[int]	20 - 24
+Total Sell Qty	[int]	24 - 28
+Open	[int]	28 - 32
+High	[int]	32 - 36
+Low	[int]	36 - 40
+Close	[int]	40 - 44
+Last Traded Timestamp	[int]	44 - 48
+Open Interest	[int]	48 - 52
+Open Interest High	[int]	52 - 56
+Open Interest Low	[int]	56 - 60
+Exchange Timestamp	[int]	60 - 64
+Market Depth	[byte[]]	64 -184
+Upper Circuit	[int]	184 - 188
+Lower Circuit	[int]	188 - 192
+Year High	[int]	192 - 196
+Year Low	[int]	196 - 200
+Market Depth Structure: (120 Bytes)
+Field	Type	Bytes
+Bid Qty 1	[int]	64 - 68
+Bid Price 1	[int]	68 - 72
+Bid Number Of Orders 1	[short]	72 - 74
+Padding	[short]	74 - 76
+Bid Qty 2	[int]	76 - 80
+Bid Price 2	[int]	80 - 84
+Bid Number Of Orders 2	[short]	84 - 86
+Padding	[short]	86 - 88
+Bid Qty 3	[int]	88 - 92
+Bid Price 3	[int]	92 - 96
+Bid Number Of Orders 3	[short]	96 - 98
+Padding	[short]	98 - 100
+Bid Qty 4	[int]	100 - 104
+Bid Price 4	[int]	104 - 108
+Bid Number Of Orders 4	[short]	108 - 110
+Padding	[short]	110 - 112
+Bid Qty 5	[int]	112 - 116
+Bid Price 5	[int]	116 - 120
+Bid Number Of Orders 5	[short]	120 - 122
+Padding	[short]	122 - 124
+Ask Qty 1	[int]	124 - 128
+Ask Price 1	[int]	128 - 132
+Ask Number Of Orders 1	[short]	132 - 134
+Padding	[short]	134 - 136
+Ask Qty 2	[int]	136 - 140
+Ask Price 2	[int]	140 - 144
+Ask Number Of Orders 2	[short]	144 - 146
+Padding	[short]	146 - 148
+Ask Qty 3	[int]	148 - 152
+Ask Price 3	[int]	152 - 156
+Ask Number Of Orders 3	[short]	156 - 158
+Padding	[short]	158 - 160
+Ask Qty 4	[int]	160 - 164
+Ask Price 4	[int]	164 - 168
+Ask Number Of Orders 4	[short]	168 - 170
+Padding	[short]	170 - 172
+Ask Qty 5	[int]	172 - 176
+Ask Price 5	[int]	176 - 180
+Ask Number Of Orders 5	[short]	180 - 182
+Padding	[short]	182 - 184
+Index Packet Structure: (48 Bytes)
+
+This packet structure is used for non-tradable index tokens.
+
+Field	Type	Bytes
+Token	[int]	0 - 4
+Last traded price	[int]	4 - 8
+High of the day	[int]	8 - 12
+Low of the day	[int]	12 - 16
+Open of the day	[int]	16 - 20
+Close of the day	[int]	20 - 24
+Price change	[int]	24 - 28
+Exchange timestamp	[int]	28 - 32
+Upper Circuit	[int]	32 - 36
+Lower Circuit	[int]	36 - 40
+Year High	[int]	40 - 44
+Year Low	[int]	44 - 48
