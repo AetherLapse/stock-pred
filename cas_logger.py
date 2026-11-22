@@ -105,8 +105,21 @@ import requests
 VERSION = "1.0"
 IST = ZoneInfo("Asia/Kolkata")
 
-BASE_URL = os.environ.get("MSTOCK_BASE_URL", "https://api.mstock.trade/openapi/typea")
-WS_URL = os.environ.get("MSTOCK_WS_URL", "wss://ws.mstock.trade")
+DEFAULT_BASE_URL = "https://api.mstock.trade/openapi/typea"
+DEFAULT_WS_URL = "wss://ws.mstock.trade"
+BASE_URL = os.environ.get("MSTOCK_BASE_URL", DEFAULT_BASE_URL)
+WS_URL = os.environ.get("MSTOCK_WS_URL", DEFAULT_WS_URL)
+
+
+def refresh_endpoints() -> None:
+    """Re-read the endpoints after .env is loaded.
+
+    These are module-level constants read at import time, and .env is only parsed inside main(),
+    so without this an MSTOCK_BASE_URL / MSTOCK_WS_URL in .env is silently ignored — the run goes
+    to production while you think it is pointed at a stub."""
+    global BASE_URL, WS_URL
+    BASE_URL = os.environ.get("MSTOCK_BASE_URL", DEFAULT_BASE_URL)
+    WS_URL = os.environ.get("MSTOCK_WS_URL", DEFAULT_WS_URL)
 
 STOP = threading.Event()
 # Index -> indicative close typed in by the operator (NSE shows it on the terminal; mStock's
@@ -1211,6 +1224,7 @@ def main() -> None:
         return
 
     load_env(args.env)
+    refresh_endpoints()
     api_key = os.environ.get("MSTOCK_API_KEY", "").strip()
     if not api_key:
         sys.exit("MSTOCK_API_KEY missing (env or .env)")

@@ -777,6 +777,28 @@ def t_late_baseline():
 check("late start: baseline is caught up, other steps are still skipped", t_late_baseline)
 
 
+
+def t_env_endpoints():
+    """MSTOCK_BASE_URL / MSTOCK_WS_URL in .env must take effect, not just shell exports."""
+    import importlib, os
+    tmp = Path("_env_test.env")
+    tmp.write_text("MSTOCK_BASE_URL=http://127.0.0.1:9999/openapi/typea\nMSTOCK_WS_URL=ws://127.0.0.1:9\n")
+    for k in ("MSTOCK_BASE_URL", "MSTOCK_WS_URL"):
+        os.environ.pop(k, None)
+    C.load_env(str(tmp))
+    C.refresh_endpoints()
+    assert C.BASE_URL.startswith("http://127.0.0.1:9999"), C.BASE_URL
+    assert C.WS_URL == "ws://127.0.0.1:9", C.WS_URL
+    # and unset means the documented production defaults
+    for k in ("MSTOCK_BASE_URL", "MSTOCK_WS_URL"):
+        os.environ.pop(k, None)
+    C.refresh_endpoints()
+    assert C.BASE_URL == C.DEFAULT_BASE_URL and C.WS_URL == C.DEFAULT_WS_URL
+
+
+check("env: base/ws URLs from .env actually apply", t_env_endpoints)
+
+
 print("\n================ RESULT ================")
 print(f"passed {len(OK)} / {len(OK) + len(FAIL)}")
 if FAIL:
