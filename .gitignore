@@ -23,3 +23,6 @@ dash*.png
 cas_logger.orig.py
 _verify_*.txt
 report*.png
+_auto_test*/
+_late_test*/
+_verify_*.txt
