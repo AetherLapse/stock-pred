@@ -26,3 +26,8 @@ report*.png
 _auto_test*/
 _late_test*/
 _verify_*.txt
+_env_test.env
+_ctrlc_test/
+_hb_test*.jsonl
+_wr_test*.jsonl
+_sigint_test/
