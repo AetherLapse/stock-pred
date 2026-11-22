@@ -895,6 +895,21 @@ check("heartbeat + final flush: liveness and a marker on abnormal exit", t_heart
 check("disk guard: refuses to start on a full disk", t_disk_guard)
 
 
+
+def t_totp_validator():
+    """A malformed secret must be rejected with a usable message, not a cryptic API failure."""
+    ok = C.validate_totp_secret("JBSWY3DPEHPK3PXPQZRTJBSWY3DPEHPK3PXP")
+    assert ok is None, ok
+    assert C.validate_totp_secret("jbswy3dpehpk3pxp") is not None          # lowercase
+    assert C.validate_totp_secret("JBSWY3DPEHPK3PXP0") is not None          # 0 is not base32
+    assert C.validate_totp_secret("JBSWY3DP EHPK3PXP") is None              # spaces stripped
+    assert C.validate_totp_secret("") is not None                           # empty
+    assert C.validate_totp_secret("AbC123tokenvalueExample") is not None    # an access token
+
+
+check("totp: secret shape is validated before the API is called", t_totp_validator)
+
+
 print("\n================ RESULT ================")
 print(f"passed {len(OK)} / {len(OK) + len(FAIL)}")
 if FAIL:

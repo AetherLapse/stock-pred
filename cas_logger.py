@@ -580,6 +580,25 @@ def make_headers(api_key: str, access_token: str) -> dict:
     return {"X-Mirae-Version": "1", "Authorization": f"token {api_key}:{access_token}"}
 
 
+def validate_totp_secret(secret: str) -> str | None:
+    """Return a human-readable problem with a TOTP secret, or None if it looks usable.
+
+    Catches the mistakes that otherwise surface as an opaque 'verifytotp failed' at 15:05:
+    spaces from copy-paste, lowercase, an access token pasted into the wrong variable."""
+    s = (secret or "").strip().replace(" ", "").replace("-", "")
+    if not s:
+        return "empty"
+    if any(c.islower() for c in s):
+        return "contains lowercase — base32 secrets are uppercase (it is probably an access token)"
+    bad = sorted({c for c in s if c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"})
+    if bad:
+        return (f"contains {''.join(bad)} — base32 only uses A-Z and 2-7 "
+                f"(0, 1, 8 and 9 never appear)")
+    if not 16 <= len(s) <= 64:
+        return f"length {len(s)} is unusual for a TOTP secret (normally 16 to 32 characters)"
+    return None
+
+
 def login(api_key: str) -> str:
     """Return an access token. Order of preference:
     1. MSTOCK_ACCESS_TOKEN (already generated today)
@@ -591,6 +610,10 @@ def login(api_key: str) -> str:
 
     totp = os.environ.get("MSTOCK_TOTP", "").strip()
     secret = os.environ.get("MSTOCK_TOTP_SECRET", "").strip()
+    if secret:
+        problem = validate_totp_secret(secret)
+        if problem:
+            sys.exit(f"MSTOCK_TOTP_SECRET: {problem}")
     if not totp and secret:
         try:
             import pyotp
@@ -1356,6 +1379,8 @@ def parse_args():
                    help="binary frame layout; docs specify 'fixed' ([count][size][packets])")
     p.add_argument("--full-depth", action="store_true", help="keep 5-level depth for options/futures too")
     p.add_argument("--no-rest", action="store_true")
+    p.add_argument("--login-check", action="store_true",
+                   help="log in, print the token validity, and exit — no market needed")
     p.add_argument("--no-dashboard", action="store_true", help="do not start the web dashboard")
     p.add_argument("--allow-single-sigint", action="store_true",
                    help="let one Ctrl+C stop the run (default: two presses inside 5s)")
@@ -1401,6 +1426,10 @@ def main() -> None:
         say(f"WARNING: {day} is a weekend, exchanges are closed.")
 
     token = login(api_key)
+    if args.login_check:
+        say(f"login OK — token {token[:4]}…{token[-4:]} ({len(token)} chars)")
+        say("credentials work. Nothing else was called.")
+        return
     headers = make_headers(api_key, token)
     rows = load_scriptmaster(headers, out_dir, day)
     say(f"scriptmaster: {len(rows)} instruments")
