@@ -335,6 +335,19 @@ INDEX_CFG = {
                    "spot_alias": ["BANKEX", "BSEBANKEX", "SPBSEBANKEX"]},
 }
 
+# NSE indices are absent from mStock's Type A scriptmaster (verified 2026-11-23: the resolver
+# found only EQ stocks whose names contain "NIFTY"). The quote endpoint still answers for the
+# exchange:SYMBOL key, and the spot is only needed at snapshot times (15:15 and 15:31), never from
+# the socket — so these are polled over REST with no WS token at all.
+INDEX_REST_KEYS = {
+    "NIFTY":      "NSE:NIFTY 50",
+    "BANKNIFTY":  "NSE:NIFTY BANK",
+    "FINNIFTY":   "NSE:NIFTY FIN SERVICE",
+    "MIDCPNIFTY": "NSE:NIFTY MIDCAP SELECT",
+    "SENSEX":     "BSE:SENSEX",
+    "BANKEX":     "BSE:BANKEX",
+}
+
 # Heavyweights from the earlier research chat. Index membership/weights are
 # APPROXIMATE and only used to decide what to record, not for any calculation.
 DEFAULT_STOCKS = [
@@ -784,22 +797,35 @@ def make_item(row: dict, role: str, index: str | None = None, **extra) -> dict |
 
 
 class Universe:
+    """Everything the session reads. Items with token=None are REST-only (no socket subscription):
+    an index whose master row is missing is still quotable by its exchange:SYMBOL key."""
+
     def __init__(self):
         self.by_token: dict[int, dict] = {}
+        self.rest_only: dict[str, dict] = {}
         self.lock = threading.Lock()
 
     def add(self, item: dict | None) -> bool:
         if not item:
             return False
         with self.lock:
+            if item.get("token") is None:
+                if item["key"] in self.rest_only:
+                    return False
+                self.rest_only[item["key"]] = item
+                return True
             if item["token"] in self.by_token:
                 return False
             self.by_token[item["token"]] = item
             return True
 
+    def all_items(self) -> list[dict]:
+        with self.lock:
+            return list(self.by_token.values()) + list(self.rest_only.values())
+
     def keys(self) -> list[str]:
         with self.lock:
-            return [i["key"] for i in self.by_token.values()]
+            return [i["key"] for i in self.by_token.values()] + list(self.rest_only.keys())
 
     def tokens(self) -> list[int]:
         with self.lock:
@@ -852,6 +878,13 @@ class Resolver:
                 score = (2 if "IND" in seg else 0) + (1 if n1 in aliases else 0) \
                     - (2 if r.get("instrument_type", "").upper() in ("EQ", "BE") else 0)
                 cands.append((score, r))
+        if not cands and idx in INDEX_REST_KEYS:
+            key = INDEX_REST_KEYS[idx]
+            ex, sym = key.split(":", 1)
+            self.notes.append(f"{idx}: not in scriptmaster — polling REST key {key} directly")
+            return {"token": None, "exchange": ex, "symbol": sym, "key": key, "role": "index",
+                    "index": idx, "exchange_token": None}
+
         if not cands:
             # Say WHY, with the evidence: any index-looking row whose name mentions the index.
             key = norm(cfg["und"])
@@ -1154,6 +1187,8 @@ class WSFeed:
         self.latest: dict[int, dict] = {}      # token -> raw (unscaled) parsed packet
         self.latest_t: dict[int, str] = {}
         self.subscribed: set[int] = set()
+        self.subscribed_at: float = 0.0
+        self.resends: int = 0
         self.n_frames = self.n_pkts = self.n_unmapped = self.n_parse_fail = self.n_text = 0
         self.layouts: dict[str, int] = defaultdict(int)
         self.connected = threading.Event()
@@ -1199,9 +1234,36 @@ class WSFeed:
             self.ws.send(payload)
 
     def _send_subscribe(self, tokens: list[int]) -> None:
+        # 2026-11-23: a 108-token universe delivered ticks for exactly 8 tokens — the remainder
+        # after the 100-token chunk. Whatever the server does with a second subscribe message,
+        # the safe shape is one message per 100 plus a pause, then the mode, then verification.
         for i in range(0, len(tokens), 100):
             self._send(json.dumps({"a": "subscribe", "v": tokens[i:i + 100]}))
+            time.sleep(0.2)
         self._send(json.dumps({"a": "mode", "v": ["full"]}))
+        time.sleep(0.2)
+        self.subscribed_at = time.monotonic()
+        self.resends += 1
+
+    def ensure_subscribed(self, share: float = 0.6, quiet_s: float = 45.0) -> None:
+        """Re-subscribe when the feed is delivering far fewer tokens than were asked for.
+
+        The failure is silent otherwise: frames arrive, the log fills, and the dashboard shows
+        only the couple of indices that happened to make it through."""
+        want = len(self.subscribed)
+        if not want or not self.connected.is_set():
+            return
+        if time.monotonic() - getattr(self, "subscribed_at", 0.0) < quiet_s:
+            return
+        got = sum(1 for t in self.subscribed if t in self.latest)
+        if got >= max(3, int(want * share)):
+            return
+        self.event("ws_resubscribe", want=want, got=got)
+        say(f"!!! feed is delivering {got}/{want} tokens — re-subscribing")
+        try:
+            self._send_subscribe(sorted(self.subscribed))
+        except Exception as exc:  # noqa: BLE001
+            note_error("ws_resubscribe", exc, self.out)
 
     def _run(self) -> None:
         import websocket  # websocket-client
@@ -1595,7 +1657,7 @@ def main() -> None:
         opt_idx = [i.strip().upper() for i in args.opt_indices.split(",") if i.strip()]
 
     sess = requests.Session()
-    index_items = {i["index"]: i for i in uni.by_token.values() if i["role"] == "index"}
+    index_items = {i["index"]: i for i in uni.all_items() if i["role"] == "index"}
     fut_items = {i["index"]: i for i in uni.by_token.values() if i["role"] == "future"}
     baseline: dict[str, dict] = {}
     baseline_stock: dict[str, float] = {}
@@ -1700,6 +1762,7 @@ def main() -> None:
                      f"Use --test 120 to test now, or --date for a different day label.")
 
     def status() -> None:
+        feed.ensure_subscribed()
         say(f"ws frames={feed.n_frames} pkts={feed.n_pkts} tokens_seen={len(feed.latest)}/{len(uni.tokens())} "
             f"unmapped={feed.n_unmapped} | rest ok={poller.n_ok} err={poller.n_err} "
             f"| {'RECORDING' if feed.recording.is_set() else 'idle'}")

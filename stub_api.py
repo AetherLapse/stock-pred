@@ -18,6 +18,9 @@ BASE_PRICES = {
     "NSE:NIFTY 50": 25000.0, "NFO:NIFTY26NOVFUT": 25040.0,
     "BSE:SENSEX": 80500.0, "BFO:SENSEX26NOVFUT": 80600.0,
     "NSE:RELIANCE": 2900.0, "NSE:HDFCBANK": 1500.0,
+    # indices mStock's scriptmaster does not list — the logger reaches them by REST key only
+    "NSE:NIFTY BANK": 58100.0, "NSE:NIFTY FIN SERVICE": 26400.0,
+    "NSE:NIFTY MIDCAP SELECT": 12850.0, "BSE:BANKEX": 61100.0,
 }
 ROWS = []
 with open(MASTER, newline="", encoding="utf-8") as f:
@@ -55,11 +58,13 @@ class H(BaseHTTPRequestHandler):
             data = {}
             for k in keys:
                 row = TOK.get(k)
-                if not row:
+                # The real API answers exchange:SYMBOL for an index even when the scriptmaster
+                # has no row for it — that is exactly the case the logger now relies on.
+                if not row and k not in BASE_PRICES:
                     continue
                 px = drift.get(k, 100.0)
                 data[k] = {
-                    "instrument_token": row["instrument_token"],
+                    "instrument_token": int(row["instrument_token"]) if row else 0,
                     "last_price": round(px, 2),
                     "ohlc": {"open": round(px * 0.999, 2), "high": round(px * 1.002, 2),
                              "low": round(px * 0.998, 2), "close": round(px * 0.9995, 2)},

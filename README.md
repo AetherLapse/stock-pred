@@ -117,6 +117,14 @@ A manual indicative close can be typed into the logger at any time (`NIFTY 25065
 futures estimate for that index and **both** numbers are recorded, so `--calibrate` can measure the
 estimate's bias afterwards.
 
+## Known-good against the live feed (2026-11-23)
+
+- NSE index spots come from REST keys (`NSE:NIFTY 50` etc.) because mStock's scriptmaster has no
+  NSE index rows; they are not subscribed on the socket at all.
+- The feed self-heals: if fewer than 60% of the requested tokens tick, it re-sends the whole
+  subscribe list and logs `ws_resubscribe`.
+- `--diagnose <log>` explains a finished session: which tokens ticked, frame sizes, server text.
+
 ## What can end the run, and what happens
 
 | signal | while recording | why |

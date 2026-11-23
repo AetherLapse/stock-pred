@@ -560,3 +560,28 @@ process starts after that, the scheduler no longer skips it — it takes the bas
 lose is the *pre-freeze* reading: a 15:15 start may capture a spot that has already begun to move, and
 the WebSocket needs a few seconds to connect and receive its first ticks. 15:05–15:10 gives a clean
 baseline and a warm feed; 15:15 works; after 15:27:30 there is nothing to record.
+
+---
+
+## 16. Two facts confirmed against the live feed (2026-11-23)
+
+**NSE indices are not in the Type A scriptmaster.** A real session resolved SENSEX and BANKEX from
+BSE rows but found only EQ stocks whose names contain "NIFTY" for the four NSE indices — no INDEX
+row exists. The quote endpoint still answers for the `exchange:SYMBOL` key, and the spot is only
+needed at snapshot times, so the logger polls these directly:
+
+| index | REST key |
+|---|---|
+| NIFTY | `NSE:NIFTY 50` |
+| BANKNIFTY | `NSE:NIFTY BANK` |
+| FINNIFTY | `NSE:NIFTY FIN SERVICE` |
+| MIDCPNIFTY | `NSE:NIFTY MIDCAP SELECT` |
+| SENSEX | `BSE:SENSEX` |
+| BANKEX | `BSE:BANKEX` |
+
+These carry **no WebSocket token** — subscribing them is impossible and unnecessary.
+
+**A multi-message subscribe does not accumulate.** With a 108-token universe the server delivered
+ticks for exactly 8 tokens: the remainder after the 100-token chunk. Send one message per 100
+tokens with a pause, then the mode, and verify: `ensure_subscribed()` re-sends the full list when
+fewer than 60% of the requested tokens have ticked.
