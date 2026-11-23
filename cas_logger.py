@@ -683,6 +683,16 @@ def diagnose(log_path: Path, show: int = 25) -> None:
             print(f"  baseline {s.get('label')}: {s.get('spots') or s.get('data', {}).keys()}")
 
 
+def normalize_totp_secret(secret: str) -> str:
+    """Base32 as the TOTP spec wants it: uppercase, no separators, padded to a multiple of 8.
+
+    Providers emit unpadded keys (a 26- or 52-character secret is common), and base64.b32decode
+    raises 'Incorrect padding' on those — which surfaces as a crash at login, not a login failure."""
+    s = (secret or "").strip().replace(" ", "").replace("-", "").upper()
+    pad = (-len(s)) % 8
+    return s + ("=" * pad)
+
+
 def validate_totp_secret(secret: str) -> str | None:
     """Return a human-readable problem with a TOTP secret, or None if it looks usable.
 
@@ -697,6 +707,11 @@ def validate_totp_secret(secret: str) -> str | None:
     if bad:
         return (f"contains {''.join(bad)} — base32 only uses A-Z and 2-7 "
                 f"(0, 1, 8 and 9 never appear)")
+    # base32 encodes in 8-character groups; only these remainders decode to whole bytes
+    if len(s) % 8 not in (0, 2, 4, 5, 7):
+        return (f"length {len(s)} cannot be a base32 secret (valid lengths are 8n, 8n+2, 8n+4, "
+                f"8n+5 or 8n+7) — it is almost certainly truncated; re-copy the full key "
+                f"(32 characters is usual)")
     if not 16 <= len(s) <= 64:
         return f"length {len(s)} is unusual for a TOTP secret (normally 16 to 32 characters)"
     return None
@@ -722,7 +737,16 @@ def login(api_key: str) -> str:
             import pyotp
         except ImportError:
             sys.exit("pyotp is required for MSTOCK_TOTP_SECRET (pip install pyotp)")
-        totp = pyotp.TOTP(secret).now()
+        norm = normalize_totp_secret(secret)
+        if len((secret or "").strip()) % 8:
+            say(f"note: MSTOCK_TOTP_SECRET is {len(secret.strip())} chars — padded to "
+                f"{len(norm)} for base32 decoding")
+        try:
+            totp = pyotp.TOTP(norm).now()
+        except Exception as exc:  # noqa: BLE001
+            sys.exit(f"MSTOCK_TOTP_SECRET cannot be decoded as base32 ({exc}). "
+                     f"The value is {len(secret.strip())} characters — re-copy the full key from "
+                     f"the panel or your authenticator app, then run --login-check again.")
     if not totp:
         sys.exit("No credentials: set MSTOCK_ACCESS_TOKEN, or MSTOCK_TOTP / MSTOCK_TOTP_SECRET "
                  "(TOTP must be enabled on trade.mstock.com -> Trading APIs).")

@@ -914,6 +914,9 @@ def t_totp_validator():
     assert C.validate_totp_secret("jbswy3dpehpk3pxp") is not None          # lowercase
     assert C.validate_totp_secret("JBSWY3DPEHPK3PXP0") is not None          # 0 is not base32
     assert C.validate_totp_secret("JBSWY3DP EHPK3PXP") is None              # spaces stripped
+    assert C.validate_totp_secret("JBSWY3DPEHPK3PXPQZRTJBSWY3DPEHPK3P") is None    # 31 chars: valid
+    trunc = C.validate_totp_secret("JBSWY3DPEHPK3PXPQZRTJBSWY3DPEHPK3")           # 30 chars: impossible
+    assert trunc and "truncated" in trunc, trunc
     assert C.validate_totp_secret("") is not None                           # empty
     assert C.validate_totp_secret("AbC123tokenvalueExample") is not None    # an access token
 
@@ -1036,6 +1039,30 @@ def t_resubscribe():
 
 
 check("feed: a partial subscription re-subscribes itself", t_resubscribe)
+
+
+
+def t_totp_padding():
+    """Unpadded secrets are the common case; they must decode, not crash."""
+    import pyotp
+    for raw, want in [("jbswy3dpehpk3pxp", "JBSWY3DPEHPK3PXP"),
+                      ("JBSWY3DPEHPK3PXPQZRTJBSWY3DPEHPK3PX", "JBSWY3DPEHPK3PXPQZRTJBSWY3DPEHPK3PX"),
+                      ("ABCD EFGH-IJKL MNOP", "ABCDEFGHIJKLMNOP"),
+                      # the shape that produced the real crash: 31 chars, unpadded
+                      ("JBSWY3DPEHPK3PXPQZRTJBSWY3DPEHPK3P", "JBSWY3DPEHPK3PXPQZRTJBSWY3DPEHPK3P")]:
+        got = C.normalize_totp_secret(raw)
+        assert got.rstrip("=") == want, (raw, got)
+        assert len(got) % 8 == 0, got
+    # pyotp needs >=112 bits, so anything 28 chars or longer must generate a code
+    for raw in ("JBSWY3DPEHPK3PXPQZRTJBSWY3DPEHPK3P", "JBSWY3DPEHPK3PXP"):
+        got = C.normalize_totp_secret(raw)
+        if len(got.rstrip("=")) >= 28:
+            assert len(pyotp.TOTP(got).now()) == 6
+    # padding a well-formed secret changes nothing
+    assert C.normalize_totp_secret("JBSWY3DPEHPK3PXP") == "JBSWY3DPEHPK3PXP"
+
+
+check("totp: unpadded secrets are padded, not crashed on", t_totp_padding)
 
 
 print("\n================ RESULT ================")
