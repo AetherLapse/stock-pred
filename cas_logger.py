@@ -1233,13 +1233,17 @@ class WSFeed:
         with self.send_lock:
             self.ws.send(payload)
 
-    def _send_subscribe(self, tokens: list[int]) -> None:
+    def _send_subscribe(self, tokens: list[int], single: bool = False) -> None:
         # 2026-11-23: a 108-token universe delivered ticks for exactly 8 tokens — the remainder
-        # after the 100-token chunk. Whatever the server does with a second subscribe message,
-        # the safe shape is one message per 100 plus a pause, then the mode, then verification.
-        for i in range(0, len(tokens), 100):
-            self._send(json.dumps({"a": "subscribe", "v": tokens[i:i + 100]}))
-            time.sleep(0.2)
+        # after the 100-token chunk. Escalate: chunked with pauses first, and if that still leaves
+        # us starved, one single message containing every token (the server may accept it).
+        if single:
+            self._send(json.dumps({"a": "subscribe", "v": tokens}))
+            time.sleep(0.3)
+        else:
+            for i in range(0, len(tokens), 100):
+                self._send(json.dumps({"a": "subscribe", "v": tokens[i:i + 100]}))
+                time.sleep(0.2)
         self._send(json.dumps({"a": "mode", "v": ["full"]}))
         time.sleep(0.2)
         self.subscribed_at = time.monotonic()
@@ -1258,10 +1262,19 @@ class WSFeed:
         got = sum(1 for t in self.subscribed if t in self.latest)
         if got >= max(3, int(want * share)):
             return
-        self.event("ws_resubscribe", want=want, got=got)
-        say(f"!!! feed is delivering {got}/{want} tokens — re-subscribing")
+        # first retry keeps the chunked shape; a second failure sends one message with everything
+        single = self.resends >= 2
+        self.event("ws_resubscribe", want=want, got=got, single=single)
+        say(f"!!! feed is delivering {got}/{want} tokens — re-subscribing"
+            f"{' in one message' if single else ''}")
+        if self.resends >= 4:
+            self.event("ws_subscription_starved", want=want, got=got)
+            say(f"!!! still {got}/{want} after {self.resends} attempts — the feed is only sending "
+                f"part of the subscription. The log records what did arrive.")
+            self.subscribed_at = time.monotonic() + 600        # back off for ten minutes
+            return
         try:
-            self._send_subscribe(sorted(self.subscribed))
+            self._send_subscribe(sorted(self.subscribed), single=single)
         except Exception as exc:  # noqa: BLE001
             note_error("ws_resubscribe", exc, self.out)
 

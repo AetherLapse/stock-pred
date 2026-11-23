@@ -1018,7 +1018,17 @@ def t_resubscribe():
     feed.ensure_subscribed(share=0.6, quiet_s=0.0)
     assert not sent
 
+    # escalation: after two attempts the whole list goes in ONE message
+    sent.clear()
+    feed.resends = 2
+    feed.latest = {1: {}}
+    feed.subscribed_at = 0.0
+    feed.ensure_subscribed(share=0.6, quiet_s=0.0)
+    assert len(sent) == 2, sent                # one subscribe + one mode, not 2 chunks
+    assert str(sorted(feed.subscribed)).replace(" ", "") in sent[0].replace(" ", "")
+
     # quiet period is honoured
+    sent.clear()
     feed.latest = {1: {}}
     feed.subscribed_at = time.monotonic()
     feed.ensure_subscribed(share=0.6, quiet_s=600.0)
