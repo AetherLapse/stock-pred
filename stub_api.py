@@ -17,13 +17,24 @@ MASTER = "_verify_master.csv"
 BASE_PRICES = {
     "NSE:NIFTY 50": 25000.0, "NFO:NIFTY26NOVFUT": 25040.0,
     "BSE:SENSEX": 80500.0, "BFO:SENSEX26NOVFUT": 80600.0,
-    "NSE:RELIANCE": 2900.0, "NSE:HDFCBANK": 1500.0,
+    "NSE:RELIANCE-EQ": 2900.0, "NSE:HDFCBANK-EQ": 1500.0,
+    # indices mStock's scriptmaster does not list — the logger reaches them by REST key only
+    "NSE:NIFTY BANK": 58100.0, "NSE:NIFTY FIN SERVICE": 26400.0,
+    "NSE:NIFTY MID SELECT": 12850.0, "BSE:BANKEX": 61100.0,
 }
 ROWS = []
 with open(MASTER, newline="", encoding="utf-8") as f:
     for r in csv.DictReader(f):
         ROWS.append(r)
 TOK = {f'{r["exchange"]}:{r["tradingsymbol"]}': r for r in ROWS}
+# The fixture master has bare NSE equity symbols; the REST contract accepts
+# only their series-qualified names, as in the broker's published ACC-EQ example.
+for row in ROWS:
+    if row["exchange"] == "NSE" and row.get("instrument_type") == "EQ":
+        bare = f'NSE:{row["tradingsymbol"]}'
+        if not bare.endswith("-EQ"):
+            TOK.pop(bare, None)
+            TOK[bare + "-EQ"] = row
 drift = {k: v for k, v in BASE_PRICES.items()}
 lock = threading.Lock()
 
@@ -55,11 +66,13 @@ class H(BaseHTTPRequestHandler):
             data = {}
             for k in keys:
                 row = TOK.get(k)
-                if not row:
+                # Simulate REST-only index quotes absent from the scriptmaster. This proves
+                # the fallback plumbing, not acceptance of these aliases by the live API.
+                if not row and k not in BASE_PRICES:
                     continue
                 px = drift.get(k, 100.0)
                 data[k] = {
-                    "instrument_token": row["instrument_token"],
+                    "instrument_token": int(row["instrument_token"]) if row else 0,
                     "last_price": round(px, 2),
                     "ohlc": {"open": round(px * 0.999, 2), "high": round(px * 1.002, 2),
                              "low": round(px * 0.998, 2), "close": round(px * 0.9995, 2)},

@@ -51,10 +51,14 @@ if /I "%~1"=="--check" (
   echo offline self-test ^(no credentials needed^)
   .venv\Scripts\python.exe verify.py
   if errorlevel 1 (pause & exit /b 1)
+  .venv\Scripts\python.exe -m unittest test_session_regressions test_dashboard_decision -v
+  if errorlevel 1 (pause & exit /b 1)
   .venv\Scripts\python.exe stress_test.py
+  if errorlevel 1 (pause & exit /b 1)
   echo.
   echo Ctrl-C behaviour ^(starts its own stub feed^)
   .venv\Scripts\python.exe test_ctrlc.py
+  if errorlevel 1 (pause & exit /b 1)
   pause
   exit /b 0
 )

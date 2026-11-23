@@ -52,6 +52,28 @@ every later run is a single command.
 ./run.sh                  # the real session
 ```
 
+After a missing-index or partial-subscription failure, run `run.bat --test 120` on Windows
+or `./run.sh --test 120` on Linux during market hours. Allow at least two minutes for
+subscription recovery; a 30-second test checks spot snapshots but can finish before retries.
+Check that `baseline locked` contains all six indices with prices and that `tokens_seen`
+approaches the subscribed count. Missing scriptmaster indices now use REST-only spot keys;
+they count as indices in the universe but are intentionally excluded from the WebSocket count.
+These fallback symbols and recovery behavior still need confirmation against the live broker.
+MIDCPNIFTY uses `NSE:NIFTY MID SELECT`, following the broker's
+[index-name annexure](https://tradingapi.mstock.com/docs/v1/Annexure/).
+Preflight and snapshot counts include only usable prices; an invalid-symbol object inside an
+otherwise successful HTTP response is reported as a quote error.
+Cash REST keys include the series required by the quote API (`NSE:HDFCBANK-EQ`,
+`BSE:HDFCBANK-A`), even when the master contains the bare name. WebSocket tokens
+and the master symbols used for weights remain unchanged.
+
+`--check` includes an offline reproduction of the 8/108 failure and verifies that all six
+REST spots reach the saved snapshot map used by the dashboard. To inspect a saved session:
+
+```bash
+./run.sh --diagnose cas_logs/YYYY-MM-DD/cas_YYYY-MM-DD.jsonl
+```
+
 Manual equivalent, if you prefer:
 
 ```bash
@@ -169,3 +191,28 @@ runs as part of `./run.sh --check`.
 Read-only: no order placement, no position management, no credentials in the repo. `.env` is
 gitignored; the logger reads the API key from the environment and gets an access token via TOTP or a
 same-day token.
+
+
+### Reading the closing-window dashboard
+
+The recorder now defaults to **15:15–15:32 IST**, with five-level depth for all
+instruments. Start at 15:05 to allow login, subscriptions and the 15:15:10 snapshot.
+The pressure calculation uses **only 15:20–15:27** and freezes at 15:27.
+
+Each index has a card even with missing data. Read the large UP PRESSURE / DOWN
+PRESSURE / BALANCED / NO SIGNAL label, coverage and reasons first. Futures agreement
+is a separate check; the conditional option section shows a scenario, not a buy order.
+Missing/stale asks are unavailable. Intrinsic value at a hypothetical target is not
+option fair value. TEST and REPLAY labels distinguish demonstrations from live data.
+
+The book signal requires at least three timely stock pairs covering 50% of the
+configured tracked weight, observed by 15:21, spanning at least 60 seconds, with an
+endpoint no older than 45 seconds. These are operational rules, not calibrated
+confidence levels. NSE and BSE listings are kept separate. Quantity changes include
+cancellations and must not be described as executed buys or sells.
+
+`cas_flow.py --logs "cas_logs/*/*.jsonl" --index NIFTY` uses the same book calculation.
+Accuracy excludes test runs, sessions without run metadata, insufficient coverage and flat outcomes; duplicate
+index/dates count once. Compare per-index results with always-up on the same eligible
+sessions. The supplied 62.5% NIFTY prior (10/16) is a reference, not a proven result
+for this signal. Clean real sessions are still needed to establish predictive value.

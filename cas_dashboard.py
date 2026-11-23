@@ -27,18 +27,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cas_logger import (DEFAULT_WEIGHTS, INDEX_CFG, MIN_GAP, STRIKE_STEP, decide,
-                        norm, pick_strike, tick_micro, tick_mid)
-from cas_flow import weight_key
+                        norm, pick_strike, tick_micro, tick_mid, now)
+from cas_flow import weight_key, book_evidence, t_of
 
 WINDOW_START = "15:20:00"
-WINDOW_END = "15:27:30"
+WINDOW_END = "15:27:00"
 
 
 def ts_of(rec):
-    try:
-        return datetime.fromisoformat(rec.get("t", ""))
-    except (TypeError, ValueError):
-        return None
+    return t_of(rec)
 
 
 class Live:
@@ -51,6 +48,7 @@ class Live:
         self.meta = {}
         self.snapshots = {}
         self.latest = {}                    # tok -> tick
+        self.last_in_window = {}
         self.first_in_window = {}           # tok -> first tick inside 15:20-15:27:30
         self.last_tick_at = None
         self.events = deque(maxlen=40)
@@ -71,22 +69,25 @@ class Live:
                 return
             with self.path.open("r", encoding="utf-8") as f:
                 f.seek(self.offset)
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+                while True:
+                    pos = f.tell()
+                    line = f.readline()
+                    if not line or not line.endswith('\n'):
+                        self.offset = pos
+                        break
+                    self.offset = f.tell()
                     try:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
                     self._apply(rec)
-                self.offset = f.tell()
 
     def _reset(self):
         """A rewritten log (replay regenerated) must not leave stale derived state behind."""
         self.meta = {}
         self.snapshots = {}
         self.latest = {}
+        self.last_in_window = {}
         self.first_in_window = {}
         self.last_tick_at = None
         self.events.clear()
@@ -96,6 +97,8 @@ class Live:
 
     def _apply(self, rec):
         kind = rec.get("type")
+        if kind == "meta" and self.meta:
+            self._reset()
         self.counts[kind] += 1
         if kind == "meta":
             self.meta = rec
@@ -111,10 +114,16 @@ class Live:
             tok = rec.get("tok")
             t = ts_of(rec)
             self.last_tick_at = time.monotonic()
-            self.latest[tok] = rec
+            if not t:
+                return
+            if tok not in self.latest or t >= ts_of(self.latest[tok]):
+                self.latest[tok] = rec
             hm = t.strftime("%H:%M:%S") if t else ""
-            if WINDOW_START <= hm <= WINDOW_END and tok not in self.first_in_window:
-                self.first_in_window[tok] = rec
+            if WINDOW_START <= hm <= WINDOW_END:
+                if tok not in self.first_in_window or t < ts_of(self.first_in_window[tok]):
+                    self.first_in_window[tok] = rec
+                if tok not in self.last_in_window or t > ts_of(self.last_in_window[tok]):
+                    self.last_in_window[tok] = rec
             idx = rec.get("idx")
             if idx and rec.get("role") == "future" and rec.get("ltp") and hm:
                 self.spark[idx].append((hm, rec["ltp"]))
@@ -145,6 +154,7 @@ class Live:
             post = self.snapshots.get("15:31:00") or self.snapshots.get("test_end")
             latest = dict(self.latest)
             first = dict(self.first_in_window)
+            window_last = dict(self.last_in_window)
             spark = {k: list(v) for k, v in self.spark.items()}
             events = list(self.events)
             counts = dict(self.counts)
@@ -156,7 +166,40 @@ class Live:
                 file_age = None
             meta = self.meta
 
+        clock = now()
+        newest = max((ts_of(r) for r in latest.values() if ts_of(r)), default=None)
+        last_age = round(max(0, (clock-newest).total_seconds()), 1) if newest else None
+        args = meta.get('args') or {}
+        mode = 'TEST' if args.get('test') else ('REPLAY' if (post or (newest and newest.date() != clock.date())) else 'LIVE')
+        reference = newest if mode == 'REPLAY' and newest else clock
+        cutoff = reference.replace(hour=15, minute=27, second=0, microsecond=0)
+        asof = min(reference, cutoff)
+        phase = 'WAITING' if reference.strftime('%H:%M:%S') < WINDOW_START else ('COLLECTING' if reference < cutoff else 'FROZEN')
+        selected = args.get('indices') or list(INDEX_CFG)
+        if isinstance(selected, str): selected = selected.split(',')
+        selected = [i.strip().upper() for i in selected if i.strip().upper() in INDEX_CFG]
+        evidence = {i: book_evidence(i, first, window_last, asof, (meta.get('weights') or {}).get('values')) for i in selected}
         indices = {}
+        why = []
+        if baseline:
+            for idx in INDEX_CFG:
+                missing = []
+                if self._index_spot(baseline, idx) is None:
+                    missing.append("no 15:15 spot")
+                has_fut_tick = any(tk.get("role") == "future" and tk.get("idx") == idx and tk.get("ltp")
+                                   for tk in latest.values())
+                if not has_fut_tick:
+                    missing.append("no futures ticks")
+                has_base_fut = any(m.get("index") == idx and m.get("role") == "future"
+                                   and ((baseline.get("rest") or {}).get(k) or {}).get("last_price")
+                                   for k, m in (baseline.get("map") or {}).items())
+                if not has_base_fut:
+                    missing.append("no 15:15 futures price")
+                if missing:
+                    why.append(f"{idx}: " + ", ".join(missing))
+        else:
+            why = ["no baseline snapshot in the log yet"]
+
         if baseline:
             for idx in INDEX_CFG:
                 spot = self._index_spot(baseline, idx)
@@ -188,9 +231,14 @@ class Live:
                 for tk in latest.values():
                     if (tk.get("role") == "option" and tk.get("idx") == idx
                             and tk.get("k") == strike and (tk.get("ot") or "").upper() == side):
-                        ask = (tk.get("asks") or [[0, None]])[0][1]
+                        levels = tk.get("asks") or []
+                        quote_t = ts_of(tk)
+                        if (levels and len(levels[0]) >= 2 and levels[0][0] and levels[0][0] > 0
+                                and levels[0][1] and levels[0][1] > 0 and quote_t
+                                and 0 <= (reference - quote_t).total_seconds() <= 45):
+                            ask = levels[0][1]
                 row = decide(idx, gap, spot, target, strike, ask)
-                flow = self._flow(idx, first, latest)
+                flow = evidence.get(idx) or book_evidence(idx, first, window_last, asof)
                 # Age is measured against the newest tick in the whole log, not wall clock, so a
                 # replay of last week's session is not reported as stale. Live, the newest tick is
                 # ~now, so the two agree.
@@ -198,8 +246,10 @@ class Live:
                 newest_t = max((ts_of(r) for r in latest.values() if ts_of(r)), default=None)
                 this_t = max((ts_of(r) for r in fut_ticks), default=None)
                 if newest_t and this_t:
-                    age = round((newest_t - this_t).total_seconds(), 1)
+                    age = round(max(0, (reference - this_t).total_seconds()), 1)
                 verdict = self._verdict(row, flow, age)
+                if verdict == 'STRONG' and (not flow.get('eligible') or ask is None):
+                    verdict = 'WATCH'
                 indices[idx] = {
                     "verdict": verdict, "tick_age": age,
                     "spot": spot, "futures": round(fut_now, 2), "gap": round(gap, 2),
@@ -219,8 +269,28 @@ class Live:
                 if a is not None and b is not None:
                     realised[idx] = round(b - a, 2)
 
+        cards = {}
+        for idx in selected:
+            e = evidence[idx]
+            row = dict(indices.get(idx) or {})
+            reasons = list(e['reasons'])
+            if idx not in indices:
+                reasons.extend([w for w in why if w.startswith(idx+':')] or ['Waiting for spot and futures baseline'])
+            direction = e['direction']
+            if mode == 'LIVE' and phase == 'COLLECTING' and (last_age is None or last_age > 45):
+                direction = 'NO SIGNAL'
+                reasons.append('Live feed is stale')
+            agreement = 'Unavailable'
+            if e['eligible'] and row.get('gap') is not None and e['score']:
+                agreement = 'AGREES' if (row['gap'] > 0) == (e['score'] > 0) else 'CONFLICT'
+            row.update(flow=e['score'], direction=direction, evidence=e, reasons=reasons,
+                       agreement=agreement, verdict=row.get('verdict', 'WATCH'))
+            cards[idx] = row
+
         return {
-            "now": datetime.now().strftime("%H:%M:%S"),
+            "now": clock.strftime("%H:%M:%S"),
+            "session": {"mode": mode, "phase": phase, "window": "15:20–15:27 IST"},
+            "cards": cards,
             "file": str(self.path),
             "records": counts,
             "last_tick_age": last_age,
@@ -229,7 +299,9 @@ class Live:
             "indices": indices,
             "realised": realised,
             "readouts": readouts[-1:] ,
-            "note": "no baseline snapshot yet (waiting for 15:15:10)" if not baseline else None,
+            "note": ("no baseline snapshot yet (waiting for 15:15:10)" if not baseline
+                     else ("no card can be built — " + " | ".join(why) if why and not indices else None)),
+            "why": why,
         }
 
     @staticmethod
@@ -251,158 +323,34 @@ class Live:
             return "CONFLICT"
         if edge is not None and edge <= 0:
             return "NO EDGE"
-        if conv == "high":
+        if conv == "high" and edge is not None:
             return "STRONG"
         return "WATCH"
 
     def _flow(self, idx, first, latest):
-        W = {norm(k): v for k, v in (DEFAULT_WEIGHTS.get(idx) or {}).items()}
-        wsum = wnet = 0.0
-        names = []
-        for tok, f in first.items():
-            role = f.get("role")
-            if role != "stock":
-                continue
-            key = weight_key(f.get("sym") or "")
-            if key not in W:
-                continue
-            l = latest.get(tok)
-            if not l:
-                continue
-            db = (l.get("tbq") or 0) - (f.get("tbq") or 0)
-            ds = (l.get("tsq") or 0) - (f.get("tsq") or 0)
-            traded = abs(db) + abs(ds)
-            if traded <= 0:
-                continue
-            imb = (db - ds) / traded
-            wsum += W[key]
-            wnet += W[key] * imb
-            names.append({"symbol": (f.get("sym") or "").split(":")[-1], "net": db - ds, "imb": imb})
-        score = round(wnet / wsum, 3) if wsum else None
-        if score is None:
-            # no weighted cash imbalance: fall back to the futures tape as a ratio
-            for tk in latest.values():
-                if tk.get("role") != "future" or tk.get("idx") != idx:
-                    continue
-                vb, vs = tk.get("signed_buy"), tk.get("signed_sell")
-                if vb is not None and vs is not None and (vb + vs) > 0:
-                    score = round((vb - vs) / (vb + vs), 3)
-                    break
-        conviction = None
-        if score is not None:
-            conviction = "high" if abs(score) >= 0.15 else ("low" if abs(score) >= 0.03 else "none")
-        bought = sorted([n for n in names if n["net"] > 0], key=lambda n: n["net"], reverse=True)[:4]
-        sold = sorted([n for n in names if n["net"] < 0], key=lambda n: n["net"])[:4]
-        return {"score": score, "conviction": conviction, "bought": bought, "sold": sold}
+        return book_evidence(idx, first, latest)
 
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAS dashboard</title>
-<style>
-:root{color-scheme:dark}
-*{box-sizing:border-box}
-body{margin:0;background:#08080c;color:#e8e6e0;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
-header{display:flex;gap:16px;align-items:baseline;padding:14px 18px;border-bottom:1px solid #1d1d27;
-  position:sticky;top:0;background:#08080cf2;backdrop-filter:blur(8px);flex-wrap:wrap}
-h1{font:600 15px ui-sans-serif,system-ui;margin:0;letter-spacing:.02em}
-.meta{color:#8b8b98;font-size:11px}
-.pill{padding:2px 8px;border-radius:999px;border:1px solid #2a2a36;font-size:10px;letter-spacing:.08em;text-transform:uppercase}
-.live{border-color:#2c5f3f;color:#7ee2a8}.dead{border-color:#6b2020;color:#ff9b9b}
-main{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,400px));gap:12px;padding:14px;justify-content:start}
-.card{background:#101018;border:1px solid #23232f;border-radius:10px;padding:12px 14px}
-.card h2{font:600 11px ui-sans-serif,system-ui;text-transform:uppercase;letter-spacing:.14em;color:#9aa0ff;margin:0 0 10px;display:flex;align-items:center;gap:8px}
-.verdict{font-size:9px;letter-spacing:.1em;padding:2px 7px;border-radius:999px;border:1px solid #2a2a36;color:#c9c9d6}
-.v-strong{border-color:#2c5f3f}.v-strong .verdict{border-color:#2c5f3f;color:#7ee2a8}
-.v-watch .verdict{border-color:#5c4a1e;color:#ffcc66}
-.v-skip{border-color:#33333f}.v-skip .verdict{color:#7d7d8c}
-.v-noedge{border-color:#6b5420}.v-noedge .verdict{border-color:#6b5420;color:#ffcc66}
-.v-conflict{border-color:#6b2020}.v-conflict .verdict{border-color:#6b2020;color:#ff9b9b}
-.v-stale{border-color:#3a3a48;opacity:.75}.v-stale .verdict{color:#ff9b9b}
-.row{display:flex;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px solid #181820}
-.row:last-child{border:0}
-.k{color:#7d7d8c}.v{font-variant-numeric:tabular-nums}
-.big{font-size:22px;letter-spacing:-.02em}
-.up{color:#7ee2a8}.down{color:#ff9b9b}.warn{color:#ffcc66}.muted{color:#7d7d8c}
-.bar{height:6px;background:#1b1b25;border-radius:3px;overflow:hidden;margin-top:8px}
-.bar span{display:block;height:100%;background:linear-gradient(90deg,#6b6bff,#9aa0ff)}
-.skip{border-color:#6b2020}
-.spark{width:100%;height:38px;margin-top:8px}
-footer{padding:8px 18px 20px;color:#5f5f6e;font-size:11px}
-</style></head><body>
-<header>
-  <h1>CAS dashboard</h1>
-  <span class="meta" id="clock">--:--:--</span>
-  <span class="pill" id="feed">waiting</span>
-  <span class="meta" id="meta"></span>
-</header>
-<main id="grid"></main>
-<footer id="foot"></footer>
-<script>
-const fmt = (n, d=2) => (n===null||n===undefined) ? '—' : Number(n).toFixed(d);
-function card(idx, d){
-  const dir = d.gap > 0 ? 'up' : 'down';
-  const flowPct = d.flow===null ? 0 : Math.min(100, Math.abs(d.flow)*100);
-  const bought = (d.bought||[]).map(b=>`${b.symbol} ${b.net>0?'+':''}${b.net}`).join(', ') || '—';
-  const sold = (d.sold||[]).map(b=>`${b.symbol} ${b.net}`).join(', ') || '—';
-  const edge = d.edge===null||d.edge===undefined ? '<span class="muted">not subscribed</span>'
-      : `<span class="${d.edge>0?'up':'warn'}">${d.edge>0?'+':''}${fmt(d.edge)}</span>`;
-  const vClass = {STRONG:'v-strong', WATCH:'v-watch', SKIP:'v-skip', 'NO EDGE':'v-noedge',
-                  CONFLICT:'v-conflict', STALE:'v-stale'}[d.verdict] || 'v-watch';
-  const ageNote = (d.tick_age===null||d.tick_age===undefined) ? ''
-      : `<span class="meta" style="margin-left:auto">${fmt(d.tick_age,0)}s</span>`;
-  return `<section class="card ${vClass}">
-    <h2>${idx}<span class="verdict">${d.verdict}</span>${ageNote}</h2>
-    <div class="row"><span class="k">gap vs 3:15</span><span class="v big ${dir==='up'?'up':'down'}">${d.gap>0?'+':''}${fmt(d.gap)}</span></div>
-    <div class="row"><span class="k">spot → target</span><span class="v">${fmt(d.spot)} → ${fmt(d.target)}</span></div>
-    <div class="row"><span class="k">trade</span><span class="v">${d.side} <b>${fmt(d.strike,0)}</b></span></div>
-    <div class="row"><span class="k">ask now</span><span class="v">${d.ask===null?'—':fmt(d.ask)}</span></div>
-    <div class="row"><span class="k">edge at target</span><span class="v">${edge}</span></div>
-    <div class="row"><span class="k">flow (${d.conviction||'—'})</span><span class="v">${d.flow===null?'—':(d.flow>0?'+':'')+fmt(d.flow,3)}</span></div>
-    <div class="bar"><span style="width:${flowPct}%"></span></div>
-    <div class="row"><span class="k">bought</span><span class="v">${bought}</span></div>
-    <div class="row"><span class="k">sold</span><span class="v">${sold}</span></div>
-    ${d.note?`<div class="row"><span class="k warn">${d.note}</span></div>`:''}
-    <canvas class="spark" data-spark='${JSON.stringify(d.spark||[])}'></canvas>
-  </section>`;
-}
-function drawSpark(c){
-  const pts = JSON.parse(c.dataset.spark||'[]');
-  if(!pts.length) return;
-  const w=c.width=c.clientWidth*2, h=c.height=76;
-  const ys=pts.map(p=>p[1]); const min=Math.min(...ys), max=Math.max(...ys);
-  const x=i=>i*(w/(pts.length-1||1)), y=v=>h-8-((v-min)/((max-min)||1))*(h-16);
-  const ctx=c.getContext('2d'); ctx.clearRect(0,0,w,h);
-  ctx.strokeStyle='#6b6bff'; ctx.lineWidth=2; ctx.beginPath();
-  pts.forEach((p,i)=> i?ctx.lineTo(x(i),y(p[1])):ctx.moveTo(x(i),y(p[1])));
-  ctx.stroke();
-}
-async function tick(){
-  try{
-    const r = await fetch('/api/live',{cache:'no-store'});
-    const s = await r.json();
-    document.getElementById('clock').textContent = s.now;
-    document.getElementById('meta').textContent =
-      `records ${s.records.ws_tick||0} ticks · ${s.records.snapshot||0} snapshots · ${s.file.split('/').slice(-1)[0]}`;
-    const f = document.getElementById('feed');
-    const age = s.last_tick_age, fage = s.file_age;
-    if(age===null||age===undefined){ f.className='pill dead'; f.textContent='no ticks'; }
-    else if(fage!==null && fage>120){ f.className='pill'; f.textContent='replay'; }
-    else if(age<10){ f.className='pill live'; f.textContent=`live · ${age}s`; }
-    else { f.className='pill dead'; f.textContent=`stale · ${age}s`; }
-    const grid = document.getElementById('grid');
-    const entries = Object.entries(s.indices);
-    grid.innerHTML = entries.length ? entries.map(([k,v])=>card(k,v)).join('')
-      : `<section class="card"><h2>waiting</h2><div class="row"><span class="k">${s.note||'no data in the log yet'}</span></div></section>`;
-    document.querySelectorAll('canvas.spark').forEach(drawSpark);
-    const ev = (s.events||[]).map(e=>`${e.t} ${e.name}`).join(' · ');
-    const real = Object.entries(s.realised||{}).map(([k,v])=>`${k} ${v>0?'+':''}${v}`).join(' · ');
-    document.getElementById('foot').textContent =
-      (real?`realised: ${real}   |   `:'') + (ev?`events: ${ev}`:'');
-  }catch(e){ /* keep the last good frame */ }
-}
-tick(); setInterval(tick, 1000);
-</script></body></html>"""
+PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Closing window · CAS</title><style>
+:root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;color:#e8eef7;background:#0b1220}*{box-sizing:border-box}body{margin:0}header,.intro,footer{padding:22px max(24px,4vw)}header{border-bottom:1px solid #28364b;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}h1{font-size:22px;margin:0}h2{font-size:17px;margin:0}.sub,small{color:#a6b6cc}.status{color:#93c5fd}.intro{padding-bottom:8px}.steps{display:flex;gap:12px;flex-wrap:wrap;margin:18px 0}.step{background:#172238;padding:10px 14px;border-radius:8px}.step strong{display:block;color:#93c5fd}.notice{max-width:1000px;line-height:1.6;color:#bdcbe0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:18px;padding:20px max(24px,4vw)}article{border:1px solid #2b3b53;background:#111d30;border-radius:14px;padding:22px}.top,.row{display:flex;justify-content:space-between;gap:16px}.badge{font-size:11px;border:1px solid #41516a;border-radius:20px;padding:4px 8px}.direction{font-size:27px;font-weight:750;margin:22px 0 6px}.up{color:#67e8b0}.down{color:#fda4af}.neutral{color:#c7d2fe}.row{padding:9px 0;border-bottom:1px solid #243249;font-size:13px}.row span:first-child{color:#a6b6cc}.row b{text-align:right}progress{width:100%;height:8px;accent-color:#60a5fa;margin:12px 0}.reason{color:#fcd58b;font-size:13px;line-height:1.5}.section{margin-top:20px;color:#9eb5d8;font-size:11px;text-transform:uppercase;letter-spacing:.08em}details{margin-top:16px;font-size:13px}summary{cursor:pointer;color:#93c5fd}table{width:100%;font-size:11px;border-collapse:collapse;margin-top:12px}td,th{text-align:left;padding:7px 2px;border-bottom:1px solid #27344a}footer{color:#a6b6cc;font-size:12px;line-height:1.7}#error{display:none;background:#783c26;padding:16px 4vw;position:sticky;top:0;z-index:2}body.disconnected .grid{opacity:.4}body.disconnected #error{display:block}
+</style></head><body><div id="error">Connection lost — displayed readings are stale. Reconnecting…</div><header><div><h1>Closing window</h1><div class="sub">Buy/sell book pressure · recording only</div></div><div><div id="status" class="status">Waiting for recorder</div><small id="clock"></small></div></header><div class="intro"><div class="steps"><div class="step"><strong>15:15</strong>Lock reference prices</div><div class="step"><strong>15:20–15:27</strong>Measure book changes</div><div class="step"><strong>15:27</strong>Freeze pressure reading</div><div class="step"><strong>Before 15:28</strong>Review evidence and conflicts</div></div><div class="notice">Start with the large pressure reading. Check data coverage, then compare with futures. Book quantities are outstanding orders: changes can include cancellations and are <b>not executed buying or selling</b>. Direction remains an unvalidated hypothesis.</div></div><main class="grid" id="grid"></main><footer><b>Benchmark: 62.5% always CE</b> — supplied historical NIFTY sample (10/16), not a measured success rate for this signal. Compare eligible real sessions per index with the same-session always-up baseline. Test runs cannot validate accuracy.<div id="foot"></div></footer><script>
+const fmt=(v,d=2)=>v==null?'—':Number(v).toLocaleString('en-IN',{maximumFractionDigits:d});
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const row=(a,b)=>`<div class="row"><span>${esc(a)}</span><b>${esc(b)}</b></div>`;
+function card(i,d){const e=d.evidence||{},dir=d.direction||'NO SIGNAL',color=dir==='UP PRESSURE'?'up':dir==='DOWN PRESSURE'?'down':'neutral';
+const names=[...(e.bought||[]),...(e.sold||[])];
+return `<article data-index="${esc(i)}"><div class="top"><h2>${esc(i)}</h2><span class="badge">${esc(d.verdict)}</span></div><div class="direction ${color}">${esc(dir)}</div><small>15:20–15:27 book-pressure hypothesis</small>
+${row('Weighted pressure (−1 to +1)',fmt(d.flow,3))}${row('Timely tracked weight',fmt((e.timely_coverage||0)*100,0)+'%')}
+<progress max="100" value="${Math.max(0,Math.min(100,(e.timely_coverage||0)*100))}"></progress>
+${row('Stocks with valid book pairs',fmt(e.stocks_seen,0))}${row('Buy quantity change',fmt(e.buy_change,0))}${row('Sell quantity change',fmt(e.sell_change,0))}
+<div class="reason">${(d.reasons||[]).map(esc).join('<br>')||'Operational coverage checks passed. Predictive accuracy is still unproven.'}</div>
+<div class="section">Independent futures check</div>${row('Agreement with pressure',d.agreement)}${row('Move since reference',fmt(d.gap)+' pts')}${row('Implied spot target',fmt(d.target))}${row('Futures quote age',d.tick_age==null?'Unavailable':fmt(d.tick_age,0)+'s')}
+<details><summary>Conditional option scenario & stock evidence</summary><p class="sub">Target assumes the futures move carries through to spot. Intrinsic value at that target is not an option fair-value estimate or a buy instruction.</p>${row('Scenario strike',d.strike==null?'Unavailable':d.side+' '+fmt(d.strike,0))}${row('Observed ask',fmt(d.ask))}${row('Intrinsic at target minus ask',fmt(d.edge))}<table><thead><tr><th>Stock</th><th>Δ buy</th><th>Δ sell</th></tr></thead><tbody>${names.map(n=>`<tr><td>${esc(n.symbol)}</td><td>${fmt(n.buy_change,0)}</td><td>${fmt(n.sell_change,0)}</td></tr>`).join('')}</tbody></table><p class="sub">Quality rules: at least three timely stock pairs, at least 50% of configured tracked weight, first observation by 15:21, span ≥60s and endpoint age ≤45s. These thresholds are operational, not statistically calibrated.</p></details></article>`}
+let busy=false;
+async function tick(){if(busy)return;busy=true;try{const r=await fetch('/api/live',{cache:'no-store',signal:AbortSignal.timeout(5000)});if(!r.ok)throw Error(r.status);const s=await r.json();document.body.classList.remove('disconnected');document.getElementById('status').textContent=`${s.session.mode} · ${s.session.phase} · ${s.session.window}`;document.getElementById('clock').textContent=`${s.now} IST · last recorded tick ${fmt(s.last_tick_age,0)}s ago`;const opened=new Set([...document.querySelectorAll('article:has(details[open])')].map(e=>e.dataset.index));document.getElementById('grid').innerHTML=Object.entries(s.cards).map(([i,d])=>card(i,d)).join('');document.querySelectorAll('article').forEach(e=>{if(opened.has(e.dataset.index))e.querySelector('details').open=true});document.getElementById('foot').textContent=`${s.records.ws_tick||0} ticks · ${s.records.snapshot||0} snapshots · ${(s.events||[]).map(e=>e.t+' '+e.name).join(' · ')}`;}catch(e){document.body.classList.add('disconnected')}finally{busy=false}}
+tick();setInterval(tick,1000);
+</script></body></html>
+"""
 
 
 def make_handler(live: Live):

@@ -17,6 +17,7 @@ import json
 import os
 import os
 import sys
+import time
 import traceback
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -155,8 +156,18 @@ check("Resolver: BSE spot + 'ACC-A' cash symbols", t_resolver_bse)
 
 
 def t_resolver_missing():
+    """A master miss now falls back to the documented REST key — no WS token, still quotable."""
     res = C.Resolver(ROWS_LOADED, today, {})
-    assert res.spot("MIDCPNIFTY") is None, "should not invent a spot"
+    it = res.spot("MIDCPNIFTY")
+    assert it is not None, "should fall back to the REST key"
+    assert it["token"] is None, f"fallback must carry no WS token: {it}"
+    assert it["key"] == "NSE:NIFTY MID SELECT", it
+    # an index with no documented key is still reported, never invented
+    C.INDEX_REST_KEYS.pop("MIDCPNIFTY", None)
+    try:
+        assert C.Resolver(ROWS_LOADED, today, {}).spot("MIDCPNIFTY") is None
+    finally:
+        C.INDEX_REST_KEYS["MIDCPNIFTY"] = "NSE:NIFTY MID SELECT"
     assert any("MIDCPNIFTY" in n for n in res.notes), res.notes
     st = res.stock("NOTASTOCK")
     assert st is None and "NOTASTOCK" in res.missing["NSE"], res.missing
@@ -947,13 +958,87 @@ def t_spot_with_placeholder_expiry():
     for r in rows:
         res = C.Resolver([r], __import__("datetime").date(2026, 11, 23), {})
         assert res.spot("NIFTY") is not None, f"failed with expiry={r['expiry']!r}"
-    # a real future with a real expiry must still be excluded from spot matching
+    # a real future with a real expiry must not be mistaken for the spot: with no index row the
+    # resolver goes to the REST fallback instead, which carries no token
     fut = row("NIFTY FUT", "NIFTY", "FUT", 999, "2026-11-27")
     res = C.Resolver([fut], __import__("datetime").date(2026, 11, 23), {})
-    assert res.spot("NIFTY") is None
+    got = res.spot("NIFTY")
+    assert got is None or got["token"] is None, f"a FUT row must not become the index spot: {got}"
 
 
 check("resolver: placeholder expiry does not hide an index spot row", t_spot_with_placeholder_expiry)
+
+
+
+def t_universe_rest_only():
+    """REST-only items must be polled and never subscribed."""
+    u = C.Universe()
+    idx = {"token": None, "exchange": "NSE", "symbol": "NIFTY 50", "key": "NSE:NIFTY 50",
+           "role": "index", "index": "NIFTY"}
+    fut = {"token": 555, "exchange": "NFO", "symbol": "NIFTY26NOVFUT", "key": "NFO:NIFTY26NOVFUT",
+           "role": "future", "index": "NIFTY"}
+    assert u.add(idx) is True and u.add(fut) is True
+    assert u.add(idx) is False                       # idempotent
+    assert "NSE:NIFTY 50" in u.keys()                # quoted over REST
+    assert 555 in u.tokens() and None not in u.tokens()   # never subscribed
+    assert len(u.all_items()) == 2
+
+
+check("universe: index without a WS token is still quoted over REST", t_universe_rest_only)
+
+
+
+def t_resubscribe():
+    """The 8-of-108 session: a feed delivering a fraction of its tokens must re-subscribe."""
+    u = C.Universe()
+    for f in ("_rs_test.jsonl", "_rs_raw.jsonl"):
+        Path(f).unlink(missing_ok=True)
+    out = C.JsonlWriter(Path("_rs_test.jsonl"))
+    raw = C.JsonlWriter(Path("_rs_raw.jsonl"))
+    feed = C.WSFeed("k", "t", u, out, raw, ">", 100.0, True)
+    sent = []
+    feed._send = lambda payload: sent.append(payload)
+
+    # not connected yet -> do nothing
+    feed.subscribed = set(range(1, 11))
+    feed.ensure_subscribed(share=0.6, quiet_s=0.0)
+    assert not sent, "must not subscribe while disconnected"
+
+    feed.connected.set()
+    feed.latest = {1: {}, 2: {}}                  # 2 of 10 arriving
+    feed.subscription_seen = {tok: time.monotonic() for tok in (1, 2)}
+    feed.subscribed_at = 0.0
+    feed.ensure_subscribed(share=0.6, quiet_s=0.0)
+    assert sent and '"subscribe"' in sent[0], sent
+    assert len(feed.subscribed) == 10
+
+    # healthy: nothing to do
+    sent.clear()
+    feed.latest = {i: {} for i in range(1, 11)}
+    feed.subscription_seen = {tok: time.monotonic() for tok in range(1, 11)}
+    feed.subscribed_at = 0.0
+    feed.ensure_subscribed(share=0.6, quiet_s=0.0)
+    assert not sent
+
+    # escalation: after two attempts the whole list goes in ONE message
+    sent.clear()
+    feed.resends = 2
+    feed.latest = {1: {}}
+    feed.subscription_seen = {1: time.monotonic()}
+    feed.subscribed_at = 0.0
+    feed.ensure_subscribed(share=0.6, quiet_s=0.0)
+    assert len(sent) == 2, sent                # one subscribe + one mode, not 2 chunks
+    assert str(sorted(feed.subscribed)).replace(" ", "") in sent[0].replace(" ", "")
+
+    # quiet period is honoured
+    sent.clear()
+    feed.latest = {1: {}}
+    feed.subscribed_at = time.monotonic()
+    feed.ensure_subscribed(share=0.6, quiet_s=600.0)
+    assert not sent
+
+
+check("feed: a partial subscription re-subscribes itself", t_resubscribe)
 
 
 print("\n================ RESULT ================")

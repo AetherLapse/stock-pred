@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
-"""cas_flow.py - who is buying and who is selling during the closing auction window.
+"""Closing-window book pressure, 15:20–15:27 IST.
 
-The question is not "where is the price" but "which side is lifting". During CAS the cash market
-stops trading, so the only *flow* evidence available is:
+Total buy/sell quantities are outstanding orders, not executed volume. Their
+changes include additions and cancellations. Whether this feed exposes auction
+activity is unproven. Futures tick-rule volume is a separate heuristic.
 
-  auction book (if forwarded)   total buy qty vs total sell qty on each stock packet
-  resting depth                 sum of 5 bid levels vs 5 ask levels
-  trade prints                  signed volume from consecutive ticks (tick rule), on futures/options
-                                which keep trading
-  options                       call vs put activity as a directional vote on the index
-
-Per instrument we emit deltas over the window (15:20 -> 15:27): Δbuy qty, Δsell qty, Δnet,
-Δdepth imbalance, signed volume. Per index we weight the stock deltas with the (approximate)
-constituent weights to get one number whose sign is the flow prediction, and then score that
-prediction against the realised candle.
-
-Usage
-    python cas_flow.py --log cas_logs/2026-11-23/cas_2026-11-23.jsonl
-    python cas_flow.py --logs "cas_logs/*/*.jsonl" --index NIFTY
+Usage: python cas_flow.py --logs "cas_logs/*/*.jsonl" --index NIFTY
 """
 from __future__ import annotations
 
@@ -25,30 +13,31 @@ import argparse
 import glob
 import json
 import statistics
+import math
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-try:
-    from cas_logger import DEFAULT_WEIGHTS, norm
-except Exception:  # pragma: no cover - standalone use
-    DEFAULT_WEIGHTS, norm = {}, (lambda s: s)
+from cas_logger import DEFAULT_WEIGHTS, INDEX_CFG, IST, norm
 
 # Observed up-rate per index from his own sheet, Aug 4 - Nov 19 2026. A flow signal has to beat this,
 # not 50%: "always CE" already wins 62.5% of NIFTY expiries. Extend as more sessions are logged.
 PRIOR_UP = {"NIFTY": (10, 16)}
 
 WINDOW_START = "15:20:00"
-WINDOW_END = "15:27:30"
+WINDOW_END = "15:27:00"
 
 
 def load(path):
     recs = []
-    for line in open(path, encoding="utf-8"):
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line:
             try:
-                recs.append(json.loads(line))
+                record = json.loads(line)
+                if record.get("type") == "meta":
+                    recs = []  # daily files may contain successive recorder runs
+                recs.append(record)
             except json.JSONDecodeError:
                 continue
     return recs
@@ -56,7 +45,8 @@ def load(path):
 
 def t_of(rec):
     try:
-        return datetime.fromisoformat(rec.get("t", ""))
+        value = datetime.fromisoformat(rec.get("t", ""))
+        return value.replace(tzinfo=IST) if value.tzinfo is None else value.astimezone(IST)
     except (TypeError, ValueError):
         return None
 
@@ -72,8 +62,74 @@ def weight_key(label: str) -> str:
     """Weight-table key for a symbol: BSE cash arrives as 'HDFCBANK-A' and NSE as 'HDFCBANK'."""
     sym = label.split(":")[-1]
     if ":" in label and label.split(":")[0].upper() == "BSE":
-        sym = sym.split("-")[0]
+        sym = sym.rsplit("-", 1)[0]
     return norm(sym).removesuffix("EQ")
+
+
+def quantity(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0 else None
+
+
+def book_evidence(index, first, last, asof=None, weights=None):
+    """Outstanding book changes, never executed buy/sell volume. One exchange per index.
+
+    Quality thresholds are conservative operational rules, not calibrated probabilities.
+    Score includes zero-change valid constituents; missing fields are never filled with zero.
+    """
+    W = {norm(k): v for k, v in ((weights or DEFAULT_WEIGHTS).get(index) or {}).items()
+         if isinstance(v, (int, float)) and math.isfinite(v) and v > 0}
+    exchange = INDEX_CFG.get(index, {}).get('spot_ex')
+    names = {}
+    for tok, f in first.items():
+        l = last.get(tok)
+        label = f.get('sym') or ''
+        key = weight_key(label)
+        if not l or f.get('role') != 'stock' or key not in W or label.split(':')[0] != exchange:
+            continue
+        tf, tl = t_of(f), t_of(l)
+        if not tf or not tl or tl <= tf or tf.date() != tl.date():
+            continue
+        values = [quantity(r.get(k)) for r in (f, l) for k in ('tbq', 'tsq')]
+        if any(v is None for v in values):
+            continue
+        b0, s0, b1, s1 = values
+        db, ds = b1-b0, s1-s0
+        change = abs(db)+abs(ds)
+        late = (tf - tf.replace(hour=15, minute=20, second=0, microsecond=0)).total_seconds()
+        age = max(0, (asof-tl).total_seconds()) if asof else 0
+        item = {'symbol': label, 'net': db-ds, 'buy_change': db, 'sell_change': ds,
+                'imb': (db-ds)/change if change else 0, 'weight': W[key],
+                'start': tf.isoformat(), 'end': tl.isoformat(), 'age': age,
+                'span': (tl-tf).total_seconds(), 'late': late, 'changed': bool(change)}
+        # Duplicate tokens for the same listing never count twice.
+        if key not in names or item['end'] > names[key]['end']:
+            names[key] = item
+    items = list(names.values())
+    covered = sum(n['weight'] for n in items)
+    expected = sum(W.values())
+    score = sum(n['weight']*n['imb'] for n in items)/covered if covered else None
+    fresh = [n for n in items if n['age'] <= 45 and n['span'] >= 60 and n['late'] <= 60]
+    quality_coverage = sum(n['weight'] for n in fresh)/expected if expected else 0
+    if fresh:
+        score = sum(n['weight']*n['imb'] for n in fresh)/sum(n['weight'] for n in fresh)
+    changed = sum(n['changed'] for n in fresh)
+    reasons = []
+    if not items: reasons.append('No valid paired stock book quantities in the window')
+    if len(fresh) < 3: reasons.append('Need at least 3 timely stock book pairs')
+    if quality_coverage < .5: reasons.append('Less than 50% of configured tracked weight has timely book data')
+    if items and not changed: reasons.append('Book quantities have not changed')
+    eligible = not reasons
+    direction = 'NO SIGNAL' if not eligible or score is None else ('BALANCED' if abs(score) < .03 else ('UP PRESSURE' if score > 0 else 'DOWN PRESSURE'))
+    return {'score': round(score, 4) if score is not None else None,
+            'conviction': None if score is None else ('high' if abs(score)>=.15 else ('low' if abs(score)>=.03 else 'none')),
+            'direction': direction, 'eligible': eligible, 'reasons': reasons,
+            'coverage': round(covered, 4), 'tracked_coverage': round(covered/expected, 4) if expected else 0,
+            'timely_coverage': round(quality_coverage, 4), 'stocks_seen': len(items), 'changed': changed,
+            'buy_change': sum(n['buy_change'] for n in items) if items else None,
+            'sell_change': sum(n['sell_change'] for n in items) if items else None,
+            'net_change': sum(n['net'] for n in items) if items else None,
+            'bought': sorted((n for n in items if n['net']>0), key=lambda n: -n['net'])[:5],
+            'sold': sorted((n for n in items if n['net']<0), key=lambda n: n['net'])[:5]}
 
 
 def depth_qty(tick, side):
@@ -177,7 +233,7 @@ def analyse(path, index_filter=None):
             continue
         sample = ticks[0]
         idx = sample.get("idx")
-        if index_filter and idx != index_filter:
+        if index_filter and idx != index_filter and sample.get("role") != "stock":
             continue
         f = instrument_features(ticks, sample.get("sym") or str(tok), sample.get("role"), idx)
         if f:
@@ -187,11 +243,14 @@ def analyse(path, index_filter=None):
     rollups = {}
     # only roll up indices the log actually tracks (futures/options carry idx); otherwise the same
     # heavyweight stock would be reported under every index whose weight table happens to list it
-    indices = {f["index"] for f in feats if f["index"]}
+    indices = {f["index"] for f in feats if f["index"] in INDEX_CFG}
+    if index_filter:
+        indices = {index_filter} if index_filter in INDEX_CFG else set()
     for index in sorted(indices):
         W = {norm(k): v for k, v in (DEFAULT_WEIGHTS.get(index) or {}).items()}
         # cash packets have no index field; attribute them through the weight table
-        stocks = [f for f in feats if f["role"] == "stock" and weight_key(f["label"]) in W]
+        stocks = [f for f in feats if f["role"] == "stock" and weight_key(f["label"]) in W
+                  and f["label"].split(":")[0] == INDEX_CFG[index]["spot_ex"]]
         futures = [f for f in feats if f["index"] == index and f["role"] == "future"]
         options = [f for f in feats if f["index"] == index and f["role"] == "option"]
 
@@ -210,8 +269,13 @@ def analyse(path, index_filter=None):
             if w and imb is not None:
                 wsum += w
                 wnet += w * imb
-        # normalise per-weight so different qty scales do not decide the ranking
-        flow_score = round(wnet / wsum, 2) if wsum else None
+        first = {tok: sorted(lst, key=lambda v: v[0])[0][1] for tok, lst in by_tok.items()}
+        last = {tok: sorted(lst, key=lambda v: v[0])[-1][1] for tok, lst in by_tok.items()}
+        end = max((t_of(r) for r in last.values() if t_of(r)), default=None)
+        if end:
+            end = end.replace(hour=15, minute=27, second=0, microsecond=0)
+        evidence = book_evidence(index, first, last, end, (meta.get('weights') or {}).get('values'))
+        flow_score = evidence['score']
 
         fut_net = None
         fut_ratio = None
@@ -237,6 +301,8 @@ def analyse(path, index_filter=None):
             conviction = "high" if abs(score) >= 0.15 else ("low" if abs(score) >= 0.03 else "none")
         rollups[index] = {
             "flow_score": score,
+            "book_evidence": evidence,
+            "eligible": evidence["eligible"] and source == "stocks",
             "score_source": source,
             "conviction": conviction,
             "coverage": round(wsum, 3),
@@ -274,19 +340,24 @@ def realised_jump(recs, index):
 def report(res):
     print(f"\n=== {Path(res['log']).name}")
     if not res["rollup"]:
-        print("  no ticks inside 15:20:00-15:27:30 — nothing to read")
+        print("  no ticks inside 15:20:00-15:27:00 — nothing to read")
         return
     recs = load(res["log"])
     for index, r in res["rollup"].items():
         jump = realised_jump(recs, index)
-        print(f"  {index}: flow {r['flow_score']} [{r.get('score_source')}] conviction {r.get('conviction')}"
+        label = r['book_evidence']['direction']
+        print(f"  {index}: {label}; raw score {r['flow_score']} [{r.get('score_source')}]"
           f"  (coverage {r['coverage']})"
               f" | futures signed net {r['future_signed_net']} | option vote {r['option_vote']:+d}")
+        if not r.get('eligible'):
+            print('     ' + '; '.join(r['book_evidence']['reasons']))
         if jump is not None:
-            actual = "UP" if jump > 0 else "DOWN"
-            if r["flow_score"] is None:
+            actual = "UP" if jump > 0 else ("DOWN" if jump < 0 else "FLAT")
+            if not r.get("eligible"):
+                print("     Insufficient timely book evidence — excluded from accuracy scoring")
+            elif r["flow_score"] is None:
                 print(f"     realised {jump:+.2f} -> {actual}; no flow signal (nothing subscribed)")
-            elif r.get("conviction") == "none":
+            elif jump == 0 or r.get("conviction") == "none":
                 print(f"     realised {jump:+.2f} -> {actual}; flow balanced — abstain")
             else:
                 pred = "UP" if r["flow_score"] > 0 else "DOWN"
@@ -294,9 +365,9 @@ def report(res):
                       f" {'HIT' if pred == actual else 'MISS'}")
         print(f"     auction book moved on {r['auction_book_moved_on']}/{r['stocks_seen']} stocks")
         if r["bought"]:
-            print("     bought: " + ", ".join(f"{s['symbol'].split(':')[-1]} {s['net']:+d}" for s in r["bought"]))
+            print("     positive net book change: " + ", ".join(f"{s['symbol'].split(':')[-1]} {s['net']:+.0f}" for s in r["bought"]))
         if r["sold"]:
-            print("     sold:   " + ", ".join(f"{s['symbol'].split(':')[-1]} {s['net']:+d}" for s in r["sold"]))
+            print("     negative net book change: " + ", ".join(f"{s['symbol'].split(':')[-1]} {s['net']:+.0f}" for s in r["sold"]))
 
 
 def main():
@@ -311,6 +382,8 @@ def main():
         ap.error("give --log or --logs")
 
     out, hits, total, ups = [], 0, 0, 0
+    per_index = defaultdict(lambda: [0, 0, 0])
+    seen = set()
     for p in paths:
         res = analyse(p, a.index)
         report(res)
@@ -318,14 +391,29 @@ def main():
         recs = load(p)
         for index, r in res["rollup"].items():
             jump = realised_jump(recs, index)
-            if jump is None or r["flow_score"] is None:
+            if jump is None or jump == 0 or r["flow_score"] is None or not r.get("eligible"):
+                continue
+            session_meta = next((x for x in recs if x.get('type') == 'meta'), {})
+            if ('args' not in session_meta or (session_meta.get('args') or {}).get('test')
+                    or session_meta.get('synthetic')):
                 continue
             if r["flow_score"] is None or r.get("conviction") == "none":
                 continue
+            date = next((t_of(x).date().isoformat() for x in recs if x.get('type') == 'ws_tick' and t_of(x)), None)
+            key = (index, date)
+            if key in seen: continue
+            seen.add(key)
+            per_index[index][0] += (r['flow_score'] > 0) == (jump > 0)
+            per_index[index][1] += 1
+            per_index[index][2] += jump > 0
             total += 1
             ups += jump > 0
             hits += (r["flow_score"] > 0) == (jump > 0)
 
+    for index, (h, n, u) in sorted(per_index.items()):
+        print(f"\n{index}: eligible sessions {n}; pressure {h}/{n} ({h/n:.1%}); same-session always UP {u}/{n} ({u/n:.1%})")
+    if not total:
+        print("\nNo eligible real sessions to score. Predictive accuracy remains unknown.")
     if total:
         print(f"\n--- flow direction hit rate: {hits}/{total} ({hits / total * 100:.0f}%)")
         print(f"    baseline 'always CE' on the same days: {ups}/{total} ({ups / total * 100:.0f}%)"
