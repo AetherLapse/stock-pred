@@ -1065,6 +1065,24 @@ def t_totp_padding():
 check("totp: unpadded secrets are padded, not crashed on", t_totp_padding)
 
 
+
+def t_env_windows_crlf():
+    """A .env written on Windows carries CRLF; a stray \r must not reach the API as part of a URL."""
+    import os
+    f = Path("_crlf_test.env")
+    f.write_bytes(b'MSTOCK_API_KEY=abc123\r\nMSTOCK_BASE_URL=https://api.mstock.trade/openapi/typea\r\n'
+                  b'MSTOCK_QUOTED="value with spaces"\r\n# comment\r\n')
+    for k in ("MSTOCK_API_KEY", "MSTOCK_BASE_URL", "MSTOCK_QUOTED"):
+        os.environ.pop(k, None)
+    C.load_env(str(f))
+    assert os.environ["MSTOCK_API_KEY"] == "abc123", repr(os.environ["MSTOCK_API_KEY"])
+    assert os.environ["MSTOCK_BASE_URL"].endswith("typea"), repr(os.environ["MSTOCK_BASE_URL"])
+    assert os.environ["MSTOCK_QUOTED"] == "value with spaces", repr(os.environ["MSTOCK_QUOTED"])
+
+
+check(".env: CRLF and quotes are stripped, no \\r reaches the URL", t_env_windows_crlf)
+
+
 print("\n================ RESULT ================")
 print(f"passed {len(OK)} / {len(OK) + len(FAIL)}")
 if FAIL:
