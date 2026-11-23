@@ -157,6 +157,26 @@ class Live:
             meta = self.meta
 
         indices = {}
+        why = []
+        if baseline:
+            for idx in INDEX_CFG:
+                missing = []
+                if self._index_spot(baseline, idx) is None:
+                    missing.append("no 15:15 spot")
+                has_fut_tick = any(tk.get("role") == "future" and tk.get("idx") == idx and tk.get("ltp")
+                                   for tk in latest.values())
+                if not has_fut_tick:
+                    missing.append("no futures ticks")
+                has_base_fut = any(m.get("index") == idx and m.get("role") == "future"
+                                   and ((baseline.get("rest") or {}).get(k) or {}).get("last_price")
+                                   for k, m in (baseline.get("map") or {}).items())
+                if not has_base_fut:
+                    missing.append("no 15:15 futures price")
+                if missing:
+                    why.append(f"{idx}: " + ", ".join(missing))
+        else:
+            why = ["no baseline snapshot in the log yet"]
+
         if baseline:
             for idx in INDEX_CFG:
                 spot = self._index_spot(baseline, idx)
@@ -229,7 +249,9 @@ class Live:
             "indices": indices,
             "realised": realised,
             "readouts": readouts[-1:] ,
-            "note": "no baseline snapshot yet (waiting for 15:15:10)" if not baseline else None,
+            "note": ("no baseline snapshot yet (waiting for 15:15:10)" if not baseline
+                     else ("no card can be built — " + " | ".join(why) if why and not indices else None)),
+            "why": why,
         }
 
     @staticmethod
@@ -393,7 +415,9 @@ async function tick(){
     const grid = document.getElementById('grid');
     const entries = Object.entries(s.indices);
     grid.innerHTML = entries.length ? entries.map(([k,v])=>card(k,v)).join('')
-      : `<section class="card"><h2>waiting</h2><div class="row"><span class="k">${s.note||'no data in the log yet'}</span></div></section>`;
+      : `<section class="card"><h2>waiting</h2><div class="row"><span class="k">${s.note||'no data in the log yet'}</span></div>` +
+        ((s.why||[]).length?`<div class="row"><span class="k warn">${s.why.join('<br>')}</span></div>`:'') +
+        `</section>`;
     document.querySelectorAll('canvas.spark').forEach(drawSpark);
     const ev = (s.events||[]).map(e=>`${e.t} ${e.name}`).join(' · ');
     const real = Object.entries(s.realised||{}).map(([k,v])=>`${k} ${v>0?'+':''}${v}`).join(' · ');

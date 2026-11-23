@@ -47,6 +47,7 @@ every later run is a single command.
 ```bash
 ./run.sh --check          # offline self-test, no credentials needed
 ./run.sh --login-check   # prove the API key + TOTP secret work (5 seconds, no market)
+./run.sh --diagnose cas_logs/<date>/cas_<date>.jsonl   # explain a finished session
 ./run.sh --test 120       # 2-minute live check during market hours
 ./run.sh --find "NIFTY 50"
 ./run.sh                  # the real session

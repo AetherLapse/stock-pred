@@ -1,0 +1,6 @@
+{"type": "meta", "universe": {"index": 2, "future": 1, "stock": 1}, "index": [{"token": 265, "symbol": "SENSEX"}, {"token": 1, "symbol": "NIFTY"}], "future": [{"token": 999, "symbol": "NIFTY FUT"}]}
+{"type": "event", "name": "ws_open", "t": "15:14:46"}
+{"type": "ws_tick", "token": 265, "t": "15:20:01", "ltp": 82840.0}
+{"type": "ws_tick", "token": 265, "t": "15:20:02", "ltp": 82841.0}
+{"type": "ws_tick", "token": 999, "t": "15:20:03", "ltp": 25100.0}
+{"type": "snapshot", "label": "15:15:10", "spots": {"SENSEX": 82840.0}}

@@ -591,6 +591,85 @@ def make_headers(api_key: str, access_token: str) -> dict:
     return {"X-Mirae-Version": "1", "Authorization": f"token {api_key}:{access_token}"}
 
 
+def diagnose(log_path: Path, show: int = 25) -> None:
+    """Explain a finished session from its own files: which tokens ticked, in what mode.
+
+    A session that records thousands of frames but only a handful of distinct tokens means the
+    subscription or the mode handshake is wrong — this prints the evidence instead of a guess."""
+    import base64
+    from collections import Counter
+
+    log_path = Path(log_path)
+    raw_path = log_path.with_name(log_path.stem + ".ws_raw.jsonl")
+    if not raw_path.exists():
+        raw_path = log_path.with_name(log_path.name.replace(".jsonl", ".ws_raw.jsonl"))
+
+    meta, ticks, snaps, texts, events = {}, Counter(), [], [], Counter()
+    with log_path.open(encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            t = r.get("type")
+            if t == "meta":
+                meta = r
+            elif t == "ws_tick":
+                ticks[r.get("token")] += 1
+            elif t == "snapshot":
+                snaps.append(r)
+            elif t == "ws_text":
+                texts.append(r.get("msg", ""))
+            elif t == "event":
+                events[r.get("name")] += 1
+
+    print(f"=== {log_path.name} ===")
+    uni = meta.get("universe") or meta.get("universe_counts") or {}
+    print(f"universe: {uni}")
+    by_tok = {}
+    for role, items in (meta.get("items") or {}).items() if isinstance(meta.get("items"), dict) else []:
+        for it in items:
+            by_tok[it.get("token")] = (role, it.get("symbol") or it.get("key"))
+    for section in ("index", "future", "stock", "option"):
+        for it in (meta.get(section) or []):
+            if isinstance(it, dict):
+                by_tok[it.get("token")] = (section, it.get("symbol") or it.get("key"))
+
+    print(f"\ndistinct tokens with ticks: {len(ticks)}")
+    for tok, n in ticks.most_common(show):
+        role, sym = by_tok.get(tok, ("?", "?"))
+        print(f"  {tok:>10}  {n:>6} ticks  {role:<7} {sym}")
+    missing = [t for t in by_tok if t not in ticks]
+    print(f"subscribed but never ticked: {len(missing)}")
+    for tok in missing[:10]:
+        role, sym = by_tok[tok]
+        print(f"  {tok:>10}  0 ticks      {role:<7} {sym}")
+
+    sizes = Counter()
+    if raw_path.exists():
+        with raw_path.open(encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i >= 400:
+                    break
+                try:
+                    b = base64.b64decode(json.loads(line).get("b64", ""))
+                except Exception:  # noqa: BLE001
+                    continue
+                sizes[len(b)] += 1
+        print(f"\nraw frame sizes (first 400): {dict(sizes.most_common(8))}")
+        print("  a frame of 8/16/24 bytes = one or two 8-byte LTP packets; a mixed frame of "
+              "n*200 = full mode")
+
+    print(f"\ntext messages from the server: {len(texts)}")
+    for m in texts[:6]:
+        print("  " + m[:200].replace("\n", " "))
+    print(f"\nevents: {dict(events)}")
+    print(f"snapshots: {[s.get('label') for s in snaps]}")
+    for s in snaps:
+        if s.get("label") and "baseline" in str(s.get("label")):
+            print(f"  baseline {s.get('label')}: {s.get('spots') or s.get('data', {}).keys()}")
+
+
 def validate_totp_secret(secret: str) -> str | None:
     """Return a human-readable problem with a TOTP secret, or None if it looks usable.
 
@@ -1410,6 +1489,8 @@ def parse_args():
                    help="binary frame layout; docs specify 'fixed' ([count][size][packets])")
     p.add_argument("--full-depth", action="store_true", help="keep 5-level depth for options/futures too")
     p.add_argument("--no-rest", action="store_true")
+    p.add_argument("--diagnose", metavar="LOG",
+                   help="explain a finished session: tokens that ticked, frame sizes, server text")
     p.add_argument("--login-check", action="store_true",
                    help="log in, print the token validity, and exit — no market needed")
     p.add_argument("--no-dashboard", action="store_true", help="do not start the web dashboard")
@@ -1435,6 +1516,10 @@ def main() -> None:
 
     load_env(args.env)
     refresh_endpoints()
+    if args.diagnose:
+        diagnose(Path(args.diagnose))
+        return
+
     api_key = os.environ.get("MSTOCK_API_KEY", "").strip()
     if not api_key:
         sys.exit("MSTOCK_API_KEY missing (env or .env)")
