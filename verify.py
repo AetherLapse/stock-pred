@@ -161,13 +161,13 @@ def t_resolver_missing():
     it = res.spot("MIDCPNIFTY")
     assert it is not None, "should fall back to the REST key"
     assert it["token"] is None, f"fallback must carry no WS token: {it}"
-    assert it["key"] == "NSE:NIFTY MIDCAP SELECT", it
+    assert it["key"] == "NSE:NIFTY MID SELECT", it
     # an index with no documented key is still reported, never invented
     C.INDEX_REST_KEYS.pop("MIDCPNIFTY", None)
     try:
         assert C.Resolver(ROWS_LOADED, today, {}).spot("MIDCPNIFTY") is None
     finally:
-        C.INDEX_REST_KEYS["MIDCPNIFTY"] = "NSE:NIFTY MIDCAP SELECT"
+        C.INDEX_REST_KEYS["MIDCPNIFTY"] = "NSE:NIFTY MID SELECT"
     assert any("MIDCPNIFTY" in n for n in res.notes), res.notes
     st = res.stock("NOTASTOCK")
     assert st is None and "NOTASTOCK" in res.missing["NSE"], res.missing
@@ -1009,6 +1009,7 @@ def t_resubscribe():
 
     feed.connected.set()
     feed.latest = {1: {}, 2: {}}                  # 2 of 10 arriving
+    feed.subscription_seen = {tok: time.monotonic() for tok in (1, 2)}
     feed.subscribed_at = 0.0
     feed.ensure_subscribed(share=0.6, quiet_s=0.0)
     assert sent and '"subscribe"' in sent[0], sent
@@ -1017,6 +1018,7 @@ def t_resubscribe():
     # healthy: nothing to do
     sent.clear()
     feed.latest = {i: {} for i in range(1, 11)}
+    feed.subscription_seen = {tok: time.monotonic() for tok in range(1, 11)}
     feed.subscribed_at = 0.0
     feed.ensure_subscribed(share=0.6, quiet_s=0.0)
     assert not sent
@@ -1025,6 +1027,7 @@ def t_resubscribe():
     sent.clear()
     feed.resends = 2
     feed.latest = {1: {}}
+    feed.subscription_seen = {1: time.monotonic()}
     feed.subscribed_at = 0.0
     feed.ensure_subscribed(share=0.6, quiet_s=0.0)
     assert len(sent) == 2, sent                # one subscribe + one mode, not 2 chunks

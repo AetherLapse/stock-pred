@@ -20,12 +20,13 @@ WHAT IT RECORDS (IST, per expiry day)
     15:14:50  snapshot  (REST OHLC + latest WS tick of every instrument)
     15:15:10  snapshot  <- frozen 3:15 baseline (cash market paused)
     15:19:50  snapshot  <- just before auction order entry opens
-    15:20:00  START recording every WS packet + REST poll; live readout every 3 s
+    15:15:00  START recording every WS packet + REST poll; live readout every 3 s
+    15:20:00  dashboard book-pressure window begins
     15:27:15  FINAL READOUT per index (--decide-at): futures move since the 3:15
               baseline, implied spot target, nearest strike that would be ITM at
               that target, its ltp/ask vs value at target. Saved as 'readout'.
               Random close can start at 15:28:00, so place orders BEFORE that.
-    15:27:30  STOP  recording      (use --rec-end 15:32:00 to also catch the jump)
+    15:32:00  STOP  recording      (flow decision window ends at 15:27)
     15:31:00  snapshot  <- post-close: actual spot / futures / option prices
     15:35:30  snapshot  <- CAS finished
 
@@ -336,14 +337,14 @@ INDEX_CFG = {
 }
 
 # NSE indices are absent from mStock's Type A scriptmaster (verified 2026-11-23: the resolver
-# found only EQ stocks whose names contain "NIFTY"). The quote endpoint still answers for the
-# exchange:SYMBOL key, and the spot is only needed at snapshot times (15:15 and 15:31), never from
-# the socket — so these are polled over REST with no WS token at all.
+# found only EQ stocks whose names contain "NIFTY"). Try exchange:SYMBOL spot keys over REST;
+# these aliases still require live preflight confirmation. Never invent a WS instrument token
+# for a missing master row. Missing REST responses remain missing, not estimated spot prices.
 INDEX_REST_KEYS = {
     "NIFTY":      "NSE:NIFTY 50",
     "BANKNIFTY":  "NSE:NIFTY BANK",
     "FINNIFTY":   "NSE:NIFTY FIN SERVICE",
-    "MIDCPNIFTY": "NSE:NIFTY MIDCAP SELECT",
+    "MIDCPNIFTY": "NSE:NIFTY MID SELECT",
     "SENSEX":     "BSE:SENSEX",
     "BANKEX":     "BSE:BANKEX",
 }
@@ -618,6 +619,7 @@ def diagnose(log_path: Path, show: int = 25) -> None:
         raw_path = log_path.with_name(log_path.name.replace(".jsonl", ".ws_raw.jsonl"))
 
     meta, ticks, snaps, texts, events = {}, Counter(), [], [], Counter()
+    by_tok, requested, has_subscription_map = {}, set(), False
     with log_path.open(encoding="utf-8", errors="ignore") as f:
         for line in f:
             try:
@@ -628,34 +630,46 @@ def diagnose(log_path: Path, show: int = 25) -> None:
             if t == "meta":
                 meta = r
             elif t == "ws_tick":
-                ticks[r.get("token")] += 1
+                tok = r.get("tok", r.get("token"))
+                if tok is not None:
+                    ticks[tok] += 1
+                    by_tok[tok] = (r.get("role") or "?", r.get("sym") or "?")
             elif t == "snapshot":
                 snaps.append(r)
             elif t == "ws_text":
                 texts.append(r.get("msg", ""))
             elif t == "event":
                 events[r.get("name")] += 1
+                if r.get("name") == "ws_subscription":
+                    has_subscription_map = True
+                    requested.update(r.get("tokens") or [])
+                    for it in r.get("items") or []:
+                        by_tok[it["token"]] = (it["role"], it["key"])
 
     print(f"=== {log_path.name} ===")
     uni = meta.get("universe") or meta.get("universe_counts") or {}
     print(f"universe: {uni}")
-    by_tok = {}
     for role, items in (meta.get("items") or {}).items() if isinstance(meta.get("items"), dict) else []:
+        has_subscription_map = True
         for it in items:
-            by_tok[it.get("token")] = (role, it.get("symbol") or it.get("key"))
+            if it.get("token") is not None:
+                requested.add(it["token"])
+                by_tok[it["token"]] = (role, it.get("symbol") or it.get("key"))
     for section in ("index", "future", "stock", "option"):
         for it in (meta.get(section) or []):
-            if isinstance(it, dict):
+            if isinstance(it, dict) and it.get("token") is not None:
+                has_subscription_map = True
+                requested.add(it["token"])
                 by_tok[it.get("token")] = (section, it.get("symbol") or it.get("key"))
 
     print(f"\ndistinct tokens with ticks: {len(ticks)}")
     for tok, n in ticks.most_common(show):
         role, sym = by_tok.get(tok, ("?", "?"))
         print(f"  {tok:>10}  {n:>6} ticks  {role:<7} {sym}")
-    missing = [t for t in by_tok if t not in ticks]
-    print(f"subscribed but never ticked: {len(missing)}")
+    missing = sorted(t for t in requested if t not in ticks)
+    print(f"subscribed but never ticked: {len(missing) if has_subscription_map else 'unknown (no subscription map in log)'}")
     for tok in missing[:10]:
-        role, sym = by_tok[tok]
+        role, sym = by_tok.get(tok, ("?", "?"))
         print(f"  {tok:>10}  0 ticks      {role:<7} {sym}")
 
     sizes = Counter()
@@ -813,8 +827,23 @@ def make_item(row: dict, role: str, index: str | None = None, **extra) -> dict |
         tok = int(row["instrument_token"])
     except (KeyError, ValueError):
         return None
+    quote_symbol = row["tradingsymbol"]
+    if role == "stock":
+        # Type A's master omits cash series from many tradingsymbol fields,
+        # while REST requires NSE:NAME-EQ / BSE:NAME-<group>. Keep the raw
+        # symbol and WS token; derive only the quote key from exchange metadata.
+        exchange = row["exchange"].upper()
+        series = ""
+        if exchange == "NSE":
+            series = row.get("instrument_type", "").upper()
+        elif exchange == "BSE":
+            group = row.get("segment", "").upper()
+            if group not in ("BSE", "EQ", "EQUITY") and re.fullmatch(r"[A-Z]{1,3}", group):
+                series = group
+        if series and not quote_symbol.upper().endswith("-" + series):
+            quote_symbol += "-" + series
     d = {"token": tok, "exchange": row["exchange"], "symbol": row["tradingsymbol"],
-         "key": f'{row["exchange"]}:{row["tradingsymbol"]}', "role": role, "index": index,
+         "key": f'{row["exchange"]}:{quote_symbol}', "role": role, "index": index,
          "exchange_token": row.get("exchange_token")}
     d.update(extra)
     return d
@@ -861,7 +890,7 @@ class Universe:
     def count_by_role(self) -> dict:
         c: dict = defaultdict(int)
         with self.lock:
-            for i in self.by_token.values():
+            for i in list(self.by_token.values()) + list(self.rest_only.values()):
                 c[i["role"]] += 1
         return dict(c)
 
@@ -1211,6 +1240,7 @@ class WSFeed:
         self.latest: dict[int, dict] = {}      # token -> raw (unscaled) parsed packet
         self.latest_t: dict[int, str] = {}
         self.subscribed: set[int] = set()
+        self.subscription_seen: dict[int, float] = {}  # monotonic arrival times since latest request
         self.subscribed_at: float = 0.0
         self.resends: int = 0
         self.n_frames = self.n_pkts = self.n_unmapped = self.n_parse_fail = self.n_text = 0
@@ -1238,8 +1268,12 @@ class WSFeed:
         if not new:
             return
         self.subscribed.update(new)
+        self.event("ws_subscription", tokens=sorted(self.subscribed),
+                   items=[it for tok in sorted(self.subscribed) if (it := self.universe.get(tok))])
         if self.connected.is_set():
-            self._send_subscribe(new)
+            # Some servers replace their subscription on each request. Adding an option
+            # must not remove the futures and stocks we already requested.
+            self._send_subscribe(sorted(self.subscribed), single=self.resends >= 2)
 
     # -- internals
     def event(self, name: str, **kw) -> None:
@@ -1258,6 +1292,7 @@ class WSFeed:
             self.ws.send(payload)
 
     def _send_subscribe(self, tokens: list[int], single: bool = False) -> None:
+        self.subscription_seen.clear()
         # 2026-11-23: a 108-token universe delivered ticks for exactly 8 tokens — the remainder
         # after the 100-token chunk. Escalate: chunked with pauses first, and if that still leaves
         # us starved, one single message containing every token (the server may accept it).
@@ -1273,6 +1308,11 @@ class WSFeed:
         self.subscribed_at = time.monotonic()
         self.resends += 1
 
+    def coverage_count(self, window_s: float = 45.0) -> int:
+        cutoff = time.monotonic() - window_s
+        return sum(1 for tok in self.subscribed
+                   if self.subscription_seen.get(tok, float('-inf')) >= cutoff)
+
     def ensure_subscribed(self, share: float = 0.6, quiet_s: float = 45.0) -> None:
         """Re-subscribe when the feed is delivering far fewer tokens than were asked for.
 
@@ -1283,8 +1323,8 @@ class WSFeed:
             return
         if time.monotonic() - getattr(self, "subscribed_at", 0.0) < quiet_s:
             return
-        got = sum(1 for t in self.subscribed if t in self.latest)
-        if got >= max(3, int(want * share)):
+        got = self.coverage_count(max(45.0, quiet_s))
+        if got >= math.ceil(want * share):
             return
         # first retry keeps the chunked shape; a second failure sends one message with everything
         single = self.resends >= 2
@@ -1298,6 +1338,7 @@ class WSFeed:
             self.subscribed_at = time.monotonic() + 600        # back off for ten minutes
             return
         try:
+            self.subscribed_at = time.monotonic()
             self._send_subscribe(sorted(self.subscribed), single=single)
         except Exception as exc:  # noqa: BLE001
             note_error("ws_resubscribe", exc, self.out)
@@ -1328,6 +1369,12 @@ class WSFeed:
         time.sleep(2)
 
     def _on_open(self, ws) -> None:
+        # Coverage and retry budget belong to this connection. Old ticks must not
+        # make a newly broken subscription appear healthy after a reconnect.
+        self.latest.clear()
+        self.latest_t.clear()
+        self.subscription_seen.clear()
+        self.resends = 0
         self.connected.set()
         self.event("ws_open")
         self._send(f"LOGIN:{self.token}")
@@ -1373,6 +1420,7 @@ class WSFeed:
                 continue
             self.n_pkts += 1
             tok = d["token"]
+            self.subscription_seen[tok] = time.monotonic()
             self.latest[tok] = d
             self.latest_t[tok] = t
             item = self.universe.get(tok)
@@ -1392,6 +1440,20 @@ class WSFeed:
 # REST poller (docs [2], [4])
 # ----------------------------------------------------------------------------
 
+def _quote_price(quote_data) -> float | None:
+    """A per-symbol error object is not a usable quote, even on HTTP 200."""
+    if not isinstance(quote_data, dict):
+        return None
+    value = quote_data.get("last_price")
+    if isinstance(value, bool):
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) and price > 0 else None
+
+
 def fetch_ohlc(sess: requests.Session, headers: dict, keys: list[str], chunk: int = 50,
                timeout=(2, 4)) -> tuple[dict, list[str]]:
     data, errors = {}, []
@@ -1403,6 +1465,11 @@ def fetch_ohlc(sess: requests.Session, headers: dict, keys: list[str], chunk: in
             j = _json(r)
             if j.get("status") == "success" and isinstance(j.get("data"), dict):
                 data.update(j["data"])
+                for key in part:
+                    quote_data = j["data"].get(key)
+                    if _quote_price(quote_data) is None:
+                        reason = (quote_data.get("message") if isinstance(quote_data, dict) else None)
+                        errors.append(f"{key}: {reason or 'missing or invalid last_price'}")
             else:
                 errors.append(f"HTTP {r.status_code}: {j.get('message') or j.get('error_type')}")
         except requests.RequestException as e:
@@ -1572,8 +1639,8 @@ def parse_args():
     p.add_argument("--bse-stocks", default="",
                    help="comma list of BSE stocks to record (default: built-in SENSEX/BANKEX lists)")
     p.add_argument("--connect-at", default="15:10:00")
-    p.add_argument("--rec-start", default="15:20:00")
-    p.add_argument("--rec-end", default="15:27:30")
+    p.add_argument("--rec-start", default="15:15:00")
+    p.add_argument("--rec-end", default="15:32:00")
     p.add_argument("--decide-at", default="15:27:15",
                    help="final readout time, must be BEFORE the random close window opens at 15:28:00")
     p.add_argument("--baseline", default="15:15:10", help="snapshot label used as the frozen 3:15 baseline")
@@ -1586,7 +1653,7 @@ def parse_args():
     p.add_argument("--little-endian", action="store_true")
     p.add_argument("--layout", default="fixed", choices=["fixed", "kite", "auto"],
                    help="binary frame layout; docs specify 'fixed' ([count][size][packets])")
-    p.add_argument("--full-depth", action="store_true", help="keep 5-level depth for options/futures too")
+    p.add_argument("--full-depth", action=argparse.BooleanOptionalAction, default=True, help="keep 5-level depth for every instrument (default; --no-full-depth keeps only the touch for derivatives)")
     p.add_argument("--no-rest", action="store_true")
     p.add_argument("--diagnose", metavar="LOG",
                    help="explain a finished session: tokens that ticked, frame sizes, server text")
@@ -1728,8 +1795,9 @@ def main() -> None:
         out = {}
         for idx, it in index_items.items():
             v = data.get(it["key"])
-            if v and v.get("last_price"):
-                out[idx] = float(v["last_price"])
+            price = _quote_price(v)
+            if price is not None:
+                out[idx] = price
         return out
 
     # ---- writers + meta -------------------------------------------------------
@@ -1746,7 +1814,8 @@ def main() -> None:
     feed: WSFeed | None = None
 
     pre, errs = fetch_ohlc(sess, headers, uni.keys())
-    say(f"REST preflight: {len(pre)}/{len(uni.keys())} symbols answered"
+    good_pre = sum(_quote_price(value) is not None for value in pre.values())
+    say(f"REST preflight: {good_pre}/{len(uni.keys())} symbols with usable prices"
         + (f" | errors: {errs[:2]}" if errs else ""))
     spots0 = spots_from(pre)
     missing_spot = [i for i in selected if i not in spots0]
@@ -1765,9 +1834,9 @@ def main() -> None:
                "opt_indices": opt_idx, "opt_expiry": {k: (v.isoformat() if v else None) for k, v in res.opt_expiry.items()},
                "weights": {"source": "approximate, from earlier research chat, unverified", "values": weights},
                "notes": res.notes, "unparsed_expiry_samples": res.unparsed_expiry_samples,
-               "sample_symbols": {r: [i["key"] for i in uni.by_token.values() if i["role"] == r][:3]
+               "sample_symbols": {r: [i["key"] for i in uni.all_items() if i["role"] == r][:3]
                                   for r in ("index", "future", "option", "stock")},
-               "preflight_missing": sorted(set(uni.keys()) - set(pre))[:40]})
+               "preflight_missing": sorted(k for k in uni.keys() if _quote_price(pre.get(k)) is None)[:40]})
     say("universe: " + ", ".join(f"{k}={v}" for k, v in uni.count_by_role().items())
         + f" | options for {opt_idx} (expiry {[str(res.opt_expiry.get(i)) for i in opt_idx]})")
     for n in res.notes:
@@ -1800,7 +1869,7 @@ def main() -> None:
 
     def status() -> None:
         feed.ensure_subscribed()
-        say(f"ws frames={feed.n_frames} pkts={feed.n_pkts} tokens_seen={len(feed.latest)}/{len(uni.tokens())} "
+        say(f"ws frames={feed.n_frames} pkts={feed.n_pkts} tokens_seen={feed.coverage_count()}/{len(uni.tokens())} "
             f"unmapped={feed.n_unmapped} | rest ok={poller.n_ok} err={poller.n_err} "
             f"| {'RECORDING' if feed.recording.is_set() else 'idle'}")
 
@@ -1930,6 +1999,7 @@ def main() -> None:
             out.write({"type": "readout", "t": ts(), "final": final, "rows": rows})
 
     def live_cb() -> None:
+        safe_call("subscription_check", feed.ensure_subscribed, out)
         safe_call("live_readout", live_panel, out, False)
 
     def snapshot(label: str) -> None:
@@ -1943,9 +2013,9 @@ def main() -> None:
         sp = safe_call("snapshot_spots", spots_from, out, data) or {}
         if label == base_label:
             for idx, it in index_items.items():
-                spot = (data.get(it["key"]) or {}).get("last_price")
+                spot = _quote_price(data.get(it["key"]))
                 fi = fut_items.get(idx)
-                fut = (data.get(fi["key"]) or {}).get("last_price") if fi else None
+                fut = _quote_price(data.get(fi["key"])) if fi else None
                 if spot:
                     base_tick = feed.latest.get(fi["token"]) if fi else None
                     pcp, pcp_n = parity_forward(uni, feed.latest, idx, feed.div)
@@ -1968,10 +2038,11 @@ def main() -> None:
         ws_now = {str(tok): {"t": feed.latest_t.get(tok), **scale(d, feed.div, True)}
                   for tok, d in feed.latest.items()}
         out.write({"type": "snapshot", "t": ts(), "label": label, "rest": data,
-                   "map": {i["key"]: {"index": i["index"], "role": i["role"]} for i in uni.by_token.values()},
+                   "map": {i["key"]: {"index": i["index"], "role": i["role"]} for i in uni.all_items()},
                    "ws_latest": ws_now, **({"errors": errs} if errs else {})})
         out.flush()
-        say(f"snapshot '{label}': rest {len(data)}/{len(uni.keys())}, ws tokens {len(feed.latest)}"
+        good_quotes = sum(_quote_price(value) is not None for value in data.values())
+        say(f"snapshot '{label}': rest {good_quotes}/{len(uni.keys())} usable prices, ws tokens {len(feed.latest)}"
             + (f", +{added} option tokens" if added else ""))
 
     if not args.no_dashboard:
